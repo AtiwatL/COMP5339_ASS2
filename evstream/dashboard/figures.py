@@ -16,6 +16,7 @@ def _style(fig, height):
     fig.update_layout(
         height=height, margin=dict(l=44, r=10, t=26, b=24), paper_bgcolor=SURFACE, plot_bgcolor=SURFACE,
         font=dict(size=11, color=TEXT_SECONDARY), hovermode="x unified", showlegend=False,
+        uirevision="keep",  # keep the user's zoom when a refresh replaces the figure
         legend=dict(orientation="h", y=1.08, x=0, font=dict(size=10)),
     )
     fig.update_xaxes(gridcolor=GRID, linecolor=GRID, zeroline=False, tickformat="%H:%M\n%d %b")
@@ -31,7 +32,7 @@ def empty(message, height=120):
     return _style(fig, height)
 
 
-def charging_curve(readings, live):
+def charging_curve(readings, live, uirevision="keep"):
     """Energy, power and SoC of each session as three small multiples on a shared time axis.
     One colour per connector, so several simultaneous sessions stay distinguishable."""
     if readings.empty:
@@ -52,11 +53,11 @@ def charging_curve(readings, live):
     _style(fig, 330)
     multi = sessions.ngroups > 1
     fig.update_layout(showlegend=multi, legend=dict(y=0.99, yanchor="top", yref="container"),
-                      margin=dict(t=56 if multi else 26), height=360 if multi else 330)
+                      margin=dict(t=56 if multi else 26), height=360 if multi else 330, uirevision=uirevision)
     return fig
 
 
-def price_history(prices, now):
+def price_history(prices, now, uirevision="keep"):
     """Charger tariff (step line) with the AEMO wholesale price on the same $/kWh scale."""
     if prices.empty:
         return empty("no price events yet")
@@ -70,7 +71,7 @@ def price_history(prices, now):
                              line=dict(color=SERIES[1], width=2, shape="hv"),
                              hovertemplate="$%{y:.2f}/kWh<extra>wholesale</extra>"))
     _style(fig, 200)
-    fig.update_layout(showlegend=True, margin=dict(t=30))
+    fig.update_layout(showlegend=True, margin=dict(t=30), uirevision=uirevision)
     # Wholesale spikes (several $/kWh) would flatten the tariff line, so the scale follows the
     # tariff and clipped spikes are flagged; the exact value stays available on hover.
     top = max(prices["price_per_kwh"].max() * 1.3, 0.1)
