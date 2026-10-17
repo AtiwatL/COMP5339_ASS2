@@ -17,5 +17,8 @@
 !/evstream/generation.py
 !/evstream/stream.py
 !/evstream/publisher.py
+!/evstream/dashboard/
 
 !/mosquitto/
+__pycache__/
+.DS_Store
