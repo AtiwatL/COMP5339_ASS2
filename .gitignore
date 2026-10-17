@@ -1,0 +1,21 @@
+# This working copy tracks only Rendy's part of the project:
+#   Task 1 (station export + data generation), Task 2 (event stream + MQTT publisher),
+#   shared configuration, README, requirements and the local broker configuration.
+# Everything else (other members' modules, the provided generator, data, databases, the
+# virtual environment) is ignored by default and re-included below file by file.
+
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+
+!/evstream/
+/evstream/*
+!/evstream/__init__.py
+!/evstream/config.py
+!/evstream/stations.py
+!/evstream/generation.py
+!/evstream/stream.py
+!/evstream/publisher.py
+
+!/mosquitto/

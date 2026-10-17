@@ -1,0 +1,17 @@
+# COMP5339 Assignment 2 - EV charging data streaming and analysis
+# Python 3.11-3.13 (developed and tested with Python 3.13.9).
+# Install into a clean virtual environment with:  python -m pip install -r requirements.txt
+# The provided generator (generator/generate_dataset.py) needs only the standard library.
+
+# Data processing and storage
+duckdb==1.5.6          # event storage; the spatial extension is installed on first use (INSTALL spatial)
+pandas==3.0.6
+numpy==2.5.4
+
+# MQTT publishing and subscription
+paho-mqtt==2.1.0
+
+# Dashboard
+dash==4.4.1
+dash-leaflet==1.1.3
+plotly==7.1.0
