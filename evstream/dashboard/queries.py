@@ -4,7 +4,7 @@ The map refresh reads the 1,926-row charger_live_state (via v_charger_live) inst
 the event history. "Now" is the simulated time (latest stored event), not the wall clock.
 """
 
-LIVE_COLUMNS = """charger_id, charger_name, operator_name, station_address, postcode, lga_name, sa4_name, latitude, longitude,
+LIVE_COLUMNS = """charger_id, operator_name, station_address, postcode, lga_name, sa4_name, latitude, longitude,
                   charger_type, charger_status, connectors, max_kw, plug_types, current_price, wholesale_price,
                   price_ts, active_sessions, last_event_ts, has_events, occupancy"""
 

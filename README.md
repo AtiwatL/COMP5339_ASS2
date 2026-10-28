@@ -371,17 +371,11 @@ python -m evstream.dashboard.app --no-ingest
 
 ## Database design
 
-The original `data/a1/ev_chargers_a1.duckdb` is not modified. `evstream.db` copies it to `data/db/ev_chargers.duckdb` and applies the A2 schema to that working copy.
+The original `data/a1/ev_chargers_a1.duckdb` is not modified. `evstream.db` copies it to `data/db/ev_chargers.duckdb` and adds only the A2 event tables and views. 
 
-A1 contains operator names and addresses but no independent charger-name attribute. The A2 copy adds `charger.charger_name` using the same display name supplied to the simulator:
-
-```text
-<operator> - <address>
-```
 
 | Object | Purpose |
 |---|---|
-| `charger.charger_name` | Generator-compatible display name in the A2 copy |
 | `event_log` | Immutable envelope and canonical JSON for each unique event |
 | `price_event` | Customer and wholesale price history |
 | `charging_session_core` | Stable session, charger and connector identity |
@@ -403,7 +397,7 @@ The dashboard includes a charger map, live network metrics, stored historical me
 
 Each charger panel explicitly displays:
 
-- **Name**, when applicable: the generator-compatible display name;
+- **Name**, rendered as `<operator> - <address>` without storing another A1 charger attribute;
 - **Address** from the A1 charging site;
 - **Operator** network from A1;
 - **Plug types** from A1;

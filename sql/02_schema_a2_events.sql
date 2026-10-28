@@ -11,26 +11,6 @@
 -- The history tables are append-only.  Only charger_live_state is updated.
 
 
--- Extend the A2 working copy of the A1 charger table with the same display name
--- used by stations.py for generator input. The original data/a1 database is
--- never modified. A1 has no independent charger/station name attribute, so the
--- reproducible name is "<operator> - <address>".
-ALTER TABLE charger ADD COLUMN IF NOT EXISTS charger_name VARCHAR;
-
-UPDATE charger AS c
-SET charger_name = names.charger_name
-FROM (
-    SELECT
-        c2.charger_id,
-        coalesce(o.operator_name, 'Unknown operator') || ' - ' || s.station_address AS charger_name
-    FROM charger c2
-    JOIN charging_site s USING (site_id)
-    LEFT JOIN operator o USING (operator_id)
-) AS names
-WHERE c.charger_id = names.charger_id
-  AND c.charger_name IS DISTINCT FROM names.charger_name;
-
-
 -- One row per MQTT message.  The event_id primary key makes redelivery under
 -- MQTT QoS 1 idempotent: the same event cannot be stored twice.  payload_json
 -- preserves the original message while the typed tables below expose values
@@ -217,7 +197,6 @@ plugs AS (
 )
 SELECT
     c.charger_id,
-    c.charger_name,
     o.operator_name,
     s.station_address,
     s.postcode,

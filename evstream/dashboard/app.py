@@ -205,7 +205,9 @@ def popup_parts(cur, charger_id, now):
     area = f"{lga} ({sa4})" if lga and sa4 else (lga or sa4 or "not recorded")
     status = _text(d["charger_status"], "not recorded")
     status_class = "ev-status ev-status-ok" if status.lower() == "operational" else "ev-status"
-    charger_name = _text(d["charger_name"], "not recorded")
+    operator = _text(d["operator_name"], "Unknown operator")
+    address = _text(d["station_address"], "address not recorded")
+    charger_name = f"{operator} - {address}"
     facts = [
         html.Div(f"Name: {charger_name}", className="ev-popup-title"),
         html.Div(className="ev-spec-grid", children=[
