@@ -31,7 +31,7 @@ SCHEMA_A2_SQL = PROJECT_ROOT / "sql" / "02_schema_a2_events.sql"
 
 # Simulation window: at least two weeks of recent AEMO NSW1 prices.
 SIM_START = "2026-10-01"
-SIM_DAYS = 14
+SIM_DAYS = 1
 
 # MQTT. The public HiveMQ broker is the one used in the Week 9 tutorial; a local
 # Mosquitto broker (MQTT_HOST=localhost) is recommended for long, full-stream runs.

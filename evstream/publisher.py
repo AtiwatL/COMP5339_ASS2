@@ -10,7 +10,7 @@
 * A retained status message (<root-parent>/status/publisher) with a last-will tells subscribers
   whether the publisher is online.
 
-Replaying a window (--from/--until): the full stream spans 14 days (2.4 M events, ~67 h at 10 msg/s),
+Replaying a window (--from/--until): the full stream has 171,987 events,
 so a demo usually replays a window. Before the window, the publisher bootstraps state by sending
 the latest price_update of every charger and the session_start of every session already active at
 the window start (these are the original events, unchanged), so the dashboard is consistent at once.
@@ -144,11 +144,13 @@ def build_query(args, start_after_seq):
         return main + " ORDER BY seq"
     # Bootstrap: latest price per charger and sessions active at the window start.
     bootstrap = f"""
+        --Bootstrap prices
         SELECT seq, charger_id, event_type, message FROM (
             SELECT *, row_number() OVER (PARTITION BY charger_id ORDER BY seq DESC) AS rn
             FROM {src} WHERE event_type = 'price_update' AND event_ts < TIMESTAMP '{args.from_ts}'
         ) WHERE rn = 1
         UNION ALL
+        --Bootstrap active sessions
         SELECT s.seq, s.charger_id, s.event_type, s.message
         FROM {src} s JOIN {src} e ON e.session_id = s.session_id AND e.event_type = 'session_end'
         WHERE s.event_type = 'session_start' AND s.event_ts < TIMESTAMP '{args.from_ts}'

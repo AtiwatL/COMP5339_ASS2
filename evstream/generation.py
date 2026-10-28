@@ -9,7 +9,7 @@ generated in two groups with group-specific parameters:
     dc     4.0, 3.0  (generator default, ARENA)       2 min
     ac     1.0, 0.6  (assumption, documented)         10 min
 
-Both groups use the same 14-day window and the same AEMO NSW1 wholesale prices, so the dynamic
+Both groups use the same 1-day window and the same AEMO NSW1 wholesale prices, so the dynamic
 tariff is consistent across the network. The outputs are concatenated into data/generated/:
 stations.csv, prices_hourly.csv, sessions.csv and session_metering.csv, each with a sim_group column.
 

@@ -4,7 +4,7 @@ The map refresh reads the 1,926-row charger_live_state (via v_charger_live) inst
 the event history. "Now" is the simulated time (latest stored event), not the wall clock.
 """
 
-LIVE_COLUMNS = """charger_id, operator_name, station_address, postcode, lga_name, sa4_name, latitude, longitude,
+LIVE_COLUMNS = """charger_id, charger_name, operator_name, station_address, postcode, lga_name, sa4_name, latitude, longitude,
                   charger_type, charger_status, connectors, max_kw, plug_types, current_price, wholesale_price,
                   price_ts, active_sessions, last_event_ts, has_events, occupancy"""
 
@@ -61,15 +61,22 @@ def charger_current(cur, charger_id, now):
         FROM v_active_sessions WHERE charger_id = ?""", [now, charger_id]).df().iloc[0].to_dict()
 
 
-def charger_hist_7d(cur, charger_id, now):
-    """Historical metrics over the last 7 simulated days (today included)."""
+def charger_history(cur, charger_id):
+    """Completed metrics over all stored stream history for one charger."""
     return cur.execute("""
-        SELECT coalesce(sum(sessions), 0) AS sessions, coalesce(sum(energy_kwh), 0) AS energy_kwh,
+        WITH span AS (
+            SELECT greatest(date_diff('minute', min(event_ts), max(event_ts)), 1) AS minutes
+            FROM event_log
+        )
+        SELECT coalesce(sum(sessions), 0) AS sessions,
+               coalesce(sum(energy_kwh), 0) AS energy_kwh,
                coalesce(sum(revenue_aud), 0) AS revenue_aud,
-               coalesce(sum(occupied_minutes), 0) / (1440.0 * 7 * any_value(c.connectors)) AS utilisation
+               coalesce(sum(occupied_minutes), 0)
+                   / (any_value(span.minutes) * any_value(c.connectors)) AS utilisation
         FROM v_charger_usage_daily u
         JOIN (SELECT charger_id, connectors FROM v_charger_live) c USING (charger_id)
-        WHERE u.charger_id = ? AND u.day > ?::DATE - 7""", [charger_id, now]).df().iloc[0].to_dict()
+        CROSS JOIN span
+        WHERE u.charger_id = ?""", [charger_id]).df().iloc[0].to_dict()
 
 
 def session_curves(cur, charger_id):
@@ -89,24 +96,19 @@ def session_curves(cur, charger_id):
     return readings, live
 
 
-def price_history(cur, charger_id, now, days=7):
-    """Tariff changes of one charger over the last days, plus the price in force at the window start."""
+def price_history(cur, charger_id):
+    """All tariff changes for one charger that were received through MQTT."""
     return cur.execute("""
-        WITH w AS (SELECT ?::TIMESTAMP - to_days(?::INTEGER) AS start_ts),
-        first AS (                      -- last change at or before the window start (price then in force)
-            SELECT coalesce(max(p.event_ts), any_value(w.start_ts)) AS from_ts
-            FROM w LEFT JOIN price_event p ON p.charger_id = ? AND p.event_ts <= w.start_ts
-        )
-        SELECT greatest(p.event_ts, w.start_ts) AS ts, p.price_per_kwh, p.wholesale_per_kwh
-        FROM price_event p, w, first
-        WHERE p.charger_id = ? AND p.event_ts >= first.from_ts
-        ORDER BY ts""", [now, days, charger_id, charger_id]).df()
+        SELECT event_ts AS ts, price_per_kwh, wholesale_per_kwh
+        FROM price_event
+        WHERE charger_id = ?
+        ORDER BY event_ts""", [charger_id]).df()
 
 
 # ---------------------------------------------------------------- KPIs and side panel (network)
 
 def kpis(cur, now):
-    """Current state from charger_live_state / v_active_sessions; historical over the last 7 days."""
+    """Current state plus completed metrics over all stored streamed history."""
     current = cur.execute("""
         SELECT sum(active_sessions) AS active_sessions,
                count(*) FILTER (WHERE active_sessions > 0) AS chargers_in_use,
@@ -118,7 +120,7 @@ def kpis(cur, now):
     hist = cur.execute("""
         SELECT count(*) AS sessions, coalesce(sum(energy_kwh), 0) / 1000 AS mwh,
                coalesce(sum(cost_aud), 0) AS revenue_aud
-        FROM charging_session WHERE end_ts > ?::TIMESTAMP - INTERVAL 7 DAY""", [now]).df().iloc[0].to_dict()
+        FROM charging_session WHERE end_ts IS NOT NULL""").df().iloc[0].to_dict()
     return current, hist
 
 
@@ -129,13 +131,14 @@ def network_hourly(cur, now, hours=48):
         ORDER BY hour""", [now, hours, now]).df()
 
 
-def top_chargers(cur, now, n=8):
+def top_chargers(cur, n=8):
+    """Highest-energy chargers across all completed sessions stored from MQTT."""
     return cur.execute("""
         SELECT s.charger_id, any_value(l.operator_name) AS operator_name, sum(s.energy_kwh) AS energy_kwh,
                count(*) AS sessions
         FROM charging_session s JOIN v_charger_live l USING (charger_id)
-        WHERE s.end_ts > ?::TIMESTAMP - INTERVAL 7 DAY
-        GROUP BY s.charger_id ORDER BY energy_kwh DESC LIMIT ?""", [now, n]).df()
+        WHERE s.end_ts IS NOT NULL
+        GROUP BY s.charger_id ORDER BY energy_kwh DESC LIMIT ?""", [n]).df()
 
 
 def event_feed(cur, n=12):

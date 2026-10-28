@@ -17,7 +17,13 @@
 !/evstream/generation.py
 !/evstream/stream.py
 !/evstream/publisher.py
+!/evstream/db.py
+!/evstream/ingest.py
 !/evstream/dashboard/
+
+!/sql/
+/sql/*
+!/sql/02_schema_a2_events.sql
 
 !/mosquitto/
 __pycache__/

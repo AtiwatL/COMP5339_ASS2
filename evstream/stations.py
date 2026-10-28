@@ -59,7 +59,7 @@ ORDER BY c.charger_id
 
 def export_stations():
     con = duckdb.connect(str(config.A1_DB), read_only=True)
-    con.execute("LOAD spatial")  # sa4_region stores a GEOMETRY column
+    con.execute("INSTALL spatial; LOAD spatial")  # sa4_region stores a GEOMETRY column
     df = con.execute(EXPORT_SQL).df()
     con.close()
 

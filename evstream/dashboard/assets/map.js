@@ -6,7 +6,7 @@ window.dashExtensions = Object.assign({}, window.dashExtensions, {
         // coloured by occupancy (free / partly busy / full / no events yet).
         pointToLayer: function (feature, latlng) {
             const p = feature.properties;
-            const price = p.price == null ? "–" : "$" + p.price.toFixed(2);
+            const price = p.price == null ? "–" : "A$" + p.price.toFixed(2);
             const html =
                 '<div class="ev-pin ev-' + p.occ + '">' +
                 '<span class="ev-dot"></span>' +

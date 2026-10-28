@@ -21,12 +21,10 @@ Every message is a JSON envelope:
 Timestamps are AEMO market time (AEST, UTC+10, no daylight saving), as in the source data.
 
 Outputs: data/stream/events.parquet (full ordered stream incl. the message JSON)
-         data/stream/events_sample.jsonl (500 consecutive messages after the 08:00 price updates on day 1, human-readable)
+         data/stream/events.jsonl (the same full stream, one MQTT JSON message per line)
 
 Run:  python -m evstream.stream
 """
-import json
-
 import duckdb
 
 from evstream import config
@@ -35,28 +33,36 @@ TS_FMT = "%Y-%m-%dT%H:%M:%S+10:00"
 
 STREAM_SQL = f"""
 CREATE TEMP TABLE ev AS
+-- Read hourly prices
 WITH prices AS (
     SELECT station_id AS charger_id, CAST(ts AS TIMESTAMP) AS ts, price_per_kwh, wholesale_per_kwh,
            lag(price_per_kwh) OVER (PARTITION BY station_id ORDER BY ts) AS prev_price
     FROM read_csv_auto('{{gen}}/prices_hourly.csv')
 ),
+
+--Produce only price-change events
 price_events AS (
     SELECT 'price_update' AS event_type, ts AS event_ts, charger_id,
            NULL::INTEGER AS connector_id, NULL::VARCHAR AS session_id,
            'p-' || charger_id || '-' || strftime(ts, '%Y%m%d%H') AS event_id,
-           json_object('price_per_kwh', price_per_kwh, 'previous_price_per_kwh', prev_price,
+           json_object('price_per_kwh', price_per_kwh,
                        'wholesale_per_kwh', wholesale_per_kwh, 'currency', 'AUD') AS data
     FROM prices
     WHERE prev_price IS NULL OR price_per_kwh <> prev_price
 ),
+
+--Read sessions
 sessions AS (SELECT * FROM read_csv_auto('{{gen}}/sessions.csv')),
+
+--Create session_start events
 start_events AS (
     SELECT 'session_start', CAST(start_ts AS TIMESTAMP), station_id, connector_id, session_id,
            'ss-' || session_id,
-           json_object('vehicle_model', vehicle_model, 'price_per_kwh', price_per_kwh,
-                       'site_type', site_type)
+           json_object('vehicle_model', vehicle_model, 'price_per_kwh', price_per_kwh)
     FROM sessions
 ),
+
+--Create session_end events
 end_events AS (
     SELECT 'session_end', CAST(end_ts AS TIMESTAMP), station_id, connector_id, session_id,
            'se-' || session_id,
@@ -67,6 +73,8 @@ end_events AS (
                        'price_per_kwh', price_per_kwh, 'cost_aud', cost_aud)
     FROM sessions
 ),
+
+--Create meter events
 meter_events AS (
     SELECT 'meter', CAST(ts AS TIMESTAMP), station_id, connector_id, session_id,
            'm-' || session_id || '-' || strftime(CAST(ts AS TIMESTAMP), '%Y%m%d%H%M'),
@@ -74,12 +82,16 @@ meter_events AS (
                        'energy_kwh', energy_kwh, 'soc_pct', soc_pct)
     FROM read_csv_auto('{{gen}}/session_metering.csv')
 ),
+
+--Combine all event types
 all_events AS (
     SELECT * FROM price_events
     UNION ALL SELECT * FROM start_events
     UNION ALL SELECT * FROM meter_events
     UNION ALL SELECT * FROM end_events
 )
+
+--Sort events and assign sequence numbers
 SELECT row_number() OVER (ORDER BY event_ts,
                                    CASE event_type WHEN 'price_update' THEN 0 WHEN 'session_start' THEN 1
                                                    WHEN 'meter' THEN 2 ELSE 3 END,
@@ -130,11 +142,19 @@ def build_stream():
         WHERE m.event_type IN ('meter', 'session_end') AND m.seq < s.seq""").fetchone()[0]
     assert bad == 0, f"{bad} events precede their session_start"
 
-    sample = con.execute(f"SELECT message FROM read_parquet('{out.as_posix()}') WHERE event_ts >= TIMESTAMP '{config.SIM_START} 08:00:01' ORDER BY seq LIMIT 500").fetchall()
-    with open(config.STREAM_DIR / "events_sample.jsonl", "w") as f:
-        for (msg,) in sample:
-            f.write(json.dumps(json.loads(msg)) + "\n")
-    print(f"-> {out.relative_to(config.PROJECT_ROOT)} ({out.stat().st_size / 1e6:.0f} MB)")
+    # Submission copy of every MQTT message. Stream in chunks so the full JSONL export does not
+    # need to be held in Python memory; each Parquet `message` value is already valid JSON.
+    jsonl = config.EVENTS_JSONL
+    messages = con.execute(
+        f"SELECT message FROM read_parquet('{out.as_posix()}') ORDER BY seq")
+    with open(jsonl, "w", encoding="utf-8", newline="\n") as f:
+        while rows := messages.fetchmany(10_000):
+            for (msg,) in rows:
+                f.write(msg + "\n")
+
+    print(f"-> {out.relative_to(config.PROJECT_ROOT)} ({out.stat().st_size / 1e6:.1f} MB)")
+    print(f"-> {jsonl.relative_to(config.PROJECT_ROOT)} ({jsonl.stat().st_size / 1e6:.1f} MB, "
+          f"{checks[0]:,} messages)")
 
 
 if __name__ == "__main__":

@@ -3,20 +3,33 @@
 Run:  python -m evstream.dashboard.app [--no-ingest] [--db PATH] [--port 8050]
 """
 import argparse
+import logging
 import threading
 from urllib.parse import parse_qs
 
 import dash_leaflet as dl
 import duckdb
+import pandas as pd
 from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 
 from evstream import config
 from evstream.dashboard import figures as fig
 from evstream.dashboard import queries as q
+from evstream.subscriber import DEFAULT_CLIENT_ID, Subscriber
 
 REFRESH_MS = 2500
 NSW_CENTER = [-33.2, 149.0]
 GRAPH_CONFIG = {"displayModeBar": False}
+
+
+def _missing(value):
+    """True for None, NaN and pandas.NA scalar values returned by DuckDB."""
+    return value is None or bool(pd.isna(value))
+
+
+def _text(value, fallback=""):
+    """Render a nullable database scalar without evaluating pandas.NA as Boolean."""
+    return fallback if _missing(value) else str(value)
 
 
 class Database:
@@ -34,6 +47,11 @@ class Database:
         with self._lock:
             return self._con.cursor()
 
+    def close(self):
+        """Close the dashboard query connection."""
+        with self._lock:
+            self._con.close()
+
 
 def occupancy_class(active, connectors, has_events):
     if not has_events:
@@ -46,7 +64,7 @@ def occupancy_class(active, connectors, has_events):
 def to_geojson(df):
     features = []
     for r in df.itertuples(index=False):
-        price = None if r.current_price != r.current_price or r.current_price is None else round(r.current_price, 2)
+        price = None if _missing(r.current_price) else round(r.current_price, 2)
         features.append({
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [r.longitude, r.latitude]},
@@ -56,9 +74,10 @@ def to_geojson(df):
                 "active": int(r.active_sessions),
                 "connectors": int(r.connectors),
                 "occ": occupancy_class(r.active_sessions, r.connectors, r.has_events),
-                "tooltip": f"<b>{r.operator_name or 'Unknown operator'}</b><br>{r.station_address or ''}<br>"
+                "tooltip": f"<b>{_text(r.operator_name, 'Unknown operator')}</b><br>"
+                           f"{_text(r.station_address)}<br>"
                            f"{r.charger_type} · {r.active_sessions}/{r.connectors} in use"
-                           + (f" · ${price:.2f}/kWh" if price is not None else ""),
+                           + (f" · A${price:.2f}/kWh" if price is not None else ""),
             },
         })
     return {"type": "FeatureCollection", "features": features}
@@ -108,14 +127,14 @@ def build_layout(db):
                     html.Div(id="pp-details"),
                     html.Div(id="pp-curve-title", className="ev-section"),
                     dcc.Graph(id="pp-curve", config=GRAPH_CONFIG),
-                    html.Div("price history - last 7 days", className="ev-section"),
+                    html.Div("price history - stored stream", className="ev-section"),
                     dcc.Graph(id="pp-price", config=GRAPH_CONFIG),
                 ]),
             ]),
             html.Aside(className="ev-side", children=[
-                html.Div("network - last 48 hours", className="ev-section"),
+                html.Div("recent streamed network activity", className="ev-section"),
                 dcc.Graph(id="g-hourly", config=GRAPH_CONFIG),
-                html.Div("top chargers by energy - last 7 days", className="ev-section"),
+                html.Div("top chargers - stored stream", className="ev-section"),
                 dcc.Graph(id="g-top", config=GRAPH_CONFIG),
                 html.Div("live event feed", className="ev-section"),
                 html.Ul(id="feed", className="ev-feed"),
@@ -129,7 +148,7 @@ def build_layout(db):
 
 
 def _num(v, fmt, none="–"):
-    return none if v is None or v != v else format(v, fmt)
+    return none if _missing(v) else format(v, fmt)
 
 
 def _metric(label, value, sub=None):
@@ -151,13 +170,13 @@ def kpi_tiles(cur, now):
             _metric("active sessions", f"{int(cur_kpi['active_sessions'] or 0):,}"),
             _metric("chargers in use", f"{int(cur_kpi['chargers_in_use'] or 0):,}", f"of {reporting:,} reporting"),
             _metric("delivered now", f"{_num(cur_kpi['mw_now'], '.2f')} MW"),
-            _metric("avg live price", f"${_num(cur_kpi['avg_price'], '.2f')}/kWh"),
+            _metric("avg live price (AUD)", f"A${_num(cur_kpi['avg_price'], '.2f')}/kWh"),
         ]),
         html.Div(className="ev-kpi-group", children=[
-            html.Div("last 7 days", className="ev-kpi-group-label"),
+            html.Div("stored history", className="ev-kpi-group-label"),
             _metric("sessions completed", f"{int(hist['sessions']):,}"),
             _metric("energy delivered", f"{hist['mwh']:,.1f} MWh"),
-            _metric("revenue", f"${hist['revenue_aud']:,.0f}"),
+            _metric("revenue (AUD)", f"A${hist['revenue_aud']:,.0f}"),
         ]),
     ]
 
@@ -166,8 +185,8 @@ def feed_items(events):
     return [html.Li([
         html.Span(f"{r.event_ts:%H:%M:%S}", className="ev-feed-ts"),
         html.Span(EVENT_LABEL.get(r.event_type, r.event_type), className=f"ev-feed-type ev-feed-{r.event_type}"),
-        html.Span(f"#{r.charger_id}" + (f"/{int(r.connector_id)}" if r.connector_id == r.connector_id and r.connector_id is not None else "")
-                  + f" {r.operator_name or ''}", className="ev-feed-who"),
+        html.Span(f"#{r.charger_id}" + ("" if _missing(r.connector_id) else f"/{int(r.connector_id)}")
+                  + f" {_text(r.operator_name)}", className="ev-feed-who"),
     ]) for r in events.itertuples()]
 
 
@@ -176,14 +195,32 @@ def popup_parts(cur, charger_id, now):
     d = q.charger_detail(cur, charger_id)
     if d is None:
         return html.Div(f"charger {charger_id} not found"), None, fig.empty("–"), fig.empty("–")
+    connectors = int(d["connectors"])
+    charger_type = _text(d["charger_type"], "type not recorded")
+    power = "Not recorded" if _missing(d["max_kw"]) else f"{d['max_kw']:.0f} kW"
+    plug_types = _text(d["plug_types"])
+    plug_value = plug_types if plug_types else html.Span("not recorded", className="ev-muted")
+    lga = _text(d["lga_name"])
+    sa4 = _text(d["sa4_name"])
+    area = f"{lga} ({sa4})" if lga and sa4 else (lga or sa4 or "not recorded")
+    status = _text(d["charger_status"], "not recorded")
+    status_class = "ev-status ev-status-ok" if status.lower() == "operational" else "ev-status"
+    charger_name = _text(d["charger_name"], "not recorded")
     facts = [
-        html.Div(d["operator_name"] or "Unknown operator", className="ev-popup-title"),
-        html.Div(f"{d['station_address'] or ''}", className="ev-popup-sub"),
+        html.Div(f"Name: {charger_name}", className="ev-popup-title"),
+        html.Div(className="ev-spec-grid", children=[
+            html.Div([html.Span("type"), html.Strong(charger_type)]),
+            html.Div([html.Span("max power"), html.Strong(power)]),
+            html.Div([html.Span("connectors"), html.Strong(str(connectors))]),
+        ]),
         html.Table(className="ev-facts", children=[html.Tbody([
-            html.Tr([html.Th("charger"), html.Td(f"#{charger_id} · {d['charger_type']} · {_num(d['max_kw'], '.0f')} kW · {d['connectors']} connectors")]),
-            html.Tr([html.Th("plug types"), html.Td(d["plug_types"] or "not recorded")]),
-            html.Tr([html.Th("area"), html.Td(", ".join(x for x in (d["lga_name"], d["sa4_name"]) if x))]),
-            html.Tr([html.Th("status"), html.Td(d["charger_status"] or "–")]),
+            html.Tr([html.Th("address"), html.Td(_text(d["station_address"], "not recorded"))]),
+            html.Tr([html.Th("operator network"), html.Td(
+                _text(d["operator_name"], "not recorded")
+            )]),
+            html.Tr([html.Th("plug types"), html.Td(plug_value)]),
+            html.Tr([html.Th("area"), html.Td(area)]),
+            html.Tr([html.Th("status"), html.Td(html.Span(status, className=status_class))]),
         ])]),
     ]
     if now is None:  # nothing stored yet, e.g. the dashboard was started before the publisher
@@ -191,24 +228,24 @@ def popup_parts(cur, charger_id, now):
                 fig.empty("no meter readings yet"), fig.empty("no price events yet"))
     cur_state = q.charger_current(cur, charger_id, now)
     in_use = int(cur_state["in_use"])
-    hist = q.charger_hist_7d(cur, charger_id, now)
+    hist = q.charger_history(cur, charger_id)
     readings, live = q.session_curves(cur, charger_id)
-    prices = q.price_history(cur, charger_id, now)
+    prices = q.price_history(cur, charger_id)
     occ = occupancy_class(in_use, d["connectors"], d["has_events"])
-    price_since = f"since {d['price_ts']:%d %b %H:%M}" if d["price_ts"] is not None and d["price_ts"] == d["price_ts"] else None
+    price_since = None if _missing(d["price_ts"]) else f"since {d['price_ts']:%d %b %H:%M}"
     details = html.Div(facts + [
         html.Div(className="ev-metric-row", children=[
-            _metric("latest price", f"${_num(d['current_price'], '.2f')}/kWh", price_since),
+            _metric("latest price (AUD)", f"A${_num(d['current_price'], '.2f')}/kWh", price_since),
             _metric("in use now", html.Span([html.Span(className=f"ev-dot ev-dot-{occ}"),
                                              f" {in_use}/{d['connectors']}"])),
-            _metric("power now", f"{cur_state['power_kw']:.0f} kW"),
+            _metric("charging power now", f"{cur_state['power_kw']:.0f} kW"),
         ]),
-        html.Div("last 7 simulated days", className="ev-section"),
+        html.Div("stored streamed history", className="ev-section"),
         html.Div(className="ev-metric-row", children=[
             _metric("sessions", f"{int(hist['sessions']):,}"),
             _metric("energy", f"{hist['energy_kwh']:,.0f} kWh"),
             _metric("utilisation", f"{_num(hist['utilisation'], '.0%')}"),
-            _metric("revenue", f"${hist['revenue_aud']:,.0f}"),
+            _metric("revenue (AUD)", f"A${hist['revenue_aud']:,.0f}"),
         ]),
     ])
     curve_title = ("charging curve - live session" + ("s" if readings["session_id"].nunique() > 1 else "")
@@ -273,7 +310,7 @@ def register_callbacks(app, db):
             if now is None:
                 return [], fig.empty("waiting for events…"), fig.empty("waiting for events…"), []
             return (kpi_tiles(cur, now), fig.network_hourly(q.network_hourly(cur, now)),
-                    fig.top_chargers(q.top_chargers(cur, now)), feed_items(q.event_feed(cur)))
+                    fig.top_chargers(q.top_chargers(cur)), feed_items(q.event_feed(cur)))
 
 
 def create_app(db):
@@ -290,12 +327,48 @@ def main():
                     help="open the stored database read-only, without subscribing to MQTT")
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--mqtt-host", default=config.MQTT_HOST, help="MQTT broker hostname")
+    ap.add_argument("--mqtt-port", type=int, default=config.MQTT_PORT, help="MQTT broker port")
+    ap.add_argument("--mqtt-client-id", default=DEFAULT_CLIENT_ID,
+                    help="stable client ID for the embedded persistent MQTT session")
+    ap.add_argument("--http-log", action="store_true",
+                    help="show Werkzeug access logs for every dashboard polling request")
     args = ap.parse_args()
+    if not 1 <= args.mqtt_port <= 65535:
+        ap.error("--mqtt-port must be between 1 and 65535")
 
-    # The embedded MQTT subscriber (evstream.ingest, Tasks 3/4 back end) is not integrated yet,
-    # so the database is always opened read-only for now.
-    db = Database(args.db, read_only=True)
-    create_app(db).run(host="127.0.0.1", port=args.port, debug=args.debug)
+    # Dash polls every 2.5 seconds. Suppress one access-log line per callback by
+    # default while preserving warnings/errors; --http-log restores full output.
+    if not args.http_log:
+        logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+    config.stop_on_sigterm()
+    # Embedded mode uses two connections in one process: EventIngestor writes
+    # while short-lived dashboard cursors read newly committed state. Both must
+    # use the same read/write access mode; --no-ingest is the read-only option.
+    db = Database(args.db, read_only=args.no_ingest)
+    subscriber = None
+    try:
+        if not args.no_ingest:
+            subscriber = Subscriber(
+                host=args.mqtt_host,
+                port=args.mqtt_port,
+                client_id=args.mqtt_client_id,
+                db_path=args.db,
+            )
+            subscriber.start()
+        # Disable the development reloader: it would create a second process,
+        # duplicate the MQTT client and reintroduce the DuckDB file-lock issue.
+        create_app(db).run(
+            host="127.0.0.1",
+            port=args.port,
+            debug=args.debug,
+            use_reloader=False,
+        )
+    finally:
+        if subscriber is not None:
+            subscriber.close()
+        db.close()
 
 
 if __name__ == "__main__":

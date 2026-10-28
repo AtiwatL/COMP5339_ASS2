@@ -1,287 +1,467 @@
-# NSW EV Charging - Data Streaming and Analysis
+# NSW EV Charging Event Stream
 
-COMP5339 Data Engineering, Assignment 2 (group TUT19_G07).
+COMP5339 Assignment 2 - **TUT19_G07**.
 
-This project simulates a real-time event stream for **all 1,926 EV chargers of our Assignment 1
-database**, publishes it over MQTT, stores every received event in DuckDB as an extension of the
-Assignment 1 schema, and visualises it on a live map dashboard.
-
-```
- A1 DuckDB ──► stations ──► generator (AEMO NSW1 prices) ──► ordered event stream (Parquet)
-                                                                      │
-                                                                      ▼  publisher (≥0.1 s, QoS 1)
-                                                               MQTT broker
-                                                                      │  subscribe COMP5339/TUT19_G07/ev/+/+
-                                                                      ▼
-                                 dashboard process:  IngestService ──► DuckDB (A1 + event tables)
-                                                     Dash + Leaflet map ◄──┘
-```
-
-## Project structure
+This project converts all 1,926 chargers from the Assignment 1 DuckDB database into a one-day synthetic EV charging stream. JSON events are published through MQTT, validated and stored in DuckDB, then displayed on a live Dash dashboard.
 
 ```text
-ev_streaming/
-|-- README.md                       this file
-|-- requirements.txt                pinned Python packages
-|-- mosquitto/mosquitto.conf        local MQTT broker configuration
-|-- generator/
-|   |-- generate_dataset.py         provided dataset generator (unmodified)
-|   `-- GENERATOR_README.md         provided documentation of the generator
-|-- sql/
-|   |-- 01_schema_a1.sql            Assignment 1 DDL (unchanged)
-|   `-- 02_schema_a2_events.sql     Assignment 2 DDL: event tables, indexes, views
-|-- evstream/                       Python package (run each stage with python -m)
-|   |-- config.py                   paths, simulation window, broker and topic settings
-|   |-- stations.py                 Task 1a  A1 chargers -> generator station list
-|   |-- generation.py               Task 1b  run generator (DC and AC groups) and merge outputs
-|   |-- stream.py                   Task 2a  ordered, de-duplicated event stream + JSON messages
-|   |-- publisher.py                Task 2b  MQTT publisher (>=0.1 s delay, QoS 1, resume)
-|   |-- ingest.py                   Task 3/4 MQTT subscriber + transactional DuckDB writer
-|   |-- subscriber.py               standalone (headless) subscriber
-|   |-- db.py                       Task 4   create the A2 database from the A1 database
-|   `-- dashboard/
-|       |-- app.py                  Task 3/4 Dash dashboard (map, pop-up, KPIs) with embedded ingest
-|       |-- queries.py              SQL used by the dashboard
-|       |-- figures.py              Plotly charts
-|       `-- assets/                 map marker JavaScript and CSS
-`-- data/
-    |-- a1/ev_chargers_a1.duckdb    copy of the Assignment 1 database (input, never modified)
-    |-- generated/                  Task 1 outputs (see "Outputs")
-    |-- stream/                     Task 2 event stream, sample, publisher checkpoint
-    `-- db/ev_chargers.duckdb       Task 4 database: A1 tables + stored MQTT events
+A1 DuckDB -> station preparation -> data generation -> stream preparation
+                                                           |
+                                                    events.parquet
+                                                    events.jsonl
+                                                           |
+                                                           v
+publisher -> Mosquitto -> subscriber -> ingestion -> A2 DuckDB -> dashboard
 ```
 
-## Setup
+## Run locally
 
-Python 3.11-3.13 is required (developed with 3.13.9). From the `ev_streaming/` folder:
+Run all Python commands from the repository directory, which contains `requirements.txt` and the `evstream` folder:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate                 # Windows PowerShell: .venv\Scripts\Activate.ps1
+```powershell
+Set-Location "C:\path\to\COMP5339_ASS2"
+```
+
+Choose either Conda or Python `venv`. Only one environment is needed.
+
+### Python environment option A: Conda
+
+Create the environment:
+
+```powershell
+conda create --name comp5339-a2 python=3.13 -y
+conda activate comp5339-a2
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-DuckDB's `spatial` extension (used by the A1 tables) is installed automatically the first time a
-database connection is opened, so internet access is required once. Internet access is also needed
-for the AEMO download (Task 1) and for the public MQTT broker.
+Activate it again in every new terminal that runs a Python component:
 
-**MQTT broker.** By default the public broker `broker.hivemq.com:1883` (as in the Week 9 tutorial)
-is used under the group-specific topic root `COMP5339/TUT19_G07/ev`, so no installation is needed.
-For long runs, backfills and the demo, a local Mosquitto broker with the project configuration is
-recommended (it is more reliable and never drops queued messages):
-
-```bash
-brew install mosquitto                                  # macOS; Windows: installer from mosquitto.org
-mosquitto -c mosquitto/mosquitto.conf                   # own terminal; macOS Homebrew path if not on PATH:
-                                                        #   /opt/homebrew/opt/mosquitto/sbin/mosquitto
-export MQTT_HOST=localhost                              # all scripts read MQTT_HOST / MQTT_PORT
-                                                        # (PowerShell: $env:MQTT_HOST="localhost")
+```powershell
+conda activate comp5339-a2
 ```
 
-`mosquitto/mosquitto.conf` removes Mosquitto's default limit of 1,000 queued messages per
-subscriber (messages beyond it are silently dropped) and raises the in-flight window, which the
-subscriber needs because it acknowledges messages only after they are committed to DuckDB.
+### Python environment option B: `venv` and pip
 
-## Execution
+Create and activate a standard Python virtual environment on Windows PowerShell:
 
-The included `data/` folder already contains every output, so steps 1-3 are only needed to
-reproduce them. Run all commands from `ev_streaming/` with the virtual environment active.
-
-| Step | Command | Result |
-|---|---|---|
-| 1 | `python -m evstream.stations` | `data/generated/stations_input*.csv` from the A1 database |
-| 2 | `python -m evstream.generation` | generated prices, sessions, meter data (≈30 s) |
-| 3 | `python -m evstream.stream` | `data/stream/events.parquet` (2.43 M ordered events) |
-| 4 | `python -m evstream.db --reset` | fresh `data/db/ev_chargers.duckdb` = A1 + event schema |
-| 5 | `python -m evstream.dashboard.app` | subscribe, store and visualise; open <http://127.0.0.1:8050> |
-| 6 | `python -m evstream.publisher --from "2026-10-01 07:45"` | publish (second terminal) |
-
-Notes:
-
-* Start the dashboard (step 5) **before** the publisher (step 6), so no message is missed.
-  The dashboard embeds the subscriber; use `python -m evstream.subscriber` instead for headless
-  ingestion. Never run both at once (DuckDB allows one writing process, and both use the same
-  MQTT client id).
-* Publisher options: `--from/--until` replay a window of event time, `--limit N` stops after N
-  messages, `--resume` continues after the last acknowledged message (`data/stream/publisher_checkpoint.json`),
-  `--delay` sets the gap between messages (minimum 0.1 s, enforced). Without `--from` the full
-  stream is published from 1 Oct 00:00.
-* `python -m evstream.dashboard.app --no-ingest` opens the stored database read-only (e.g. for
-  browsing the submitted database without a broker).
-* `python -m evstream.verify` (with the dashboard/subscriber stopped) checks that every acknowledged
-  message is stored exactly once and that the tables are consistent.
-
-### How the submitted database was filled, and how to run the demo
-
-Publishing all 2.43 M events at 0.1 s would take about 67 hours, so the history was **backfilled**
-through the same MQTT pipeline (same topics, messages, QoS 1, subscriber and tables) without the
-delay, using the explicit `--backfill` mode (local broker only). The live part of the stream is
-then published normally with the enforced ≥ 0.1 s delay:
-
-```bash
-# 1. history: 1 Oct 00:00 -> 14 Oct 07:00, backfilled (about 10 minutes)
-mosquitto -c mosquitto/mosquitto.conf                                    # terminal 1
-MQTT_HOST=localhost python -m evstream.subscriber                       # terminal 2 (stop with Ctrl-C when done)
-python -m evstream.publisher --backfill --host localhost --until "2026-10-14 07:00"   # terminal 3
-
-# 2. live demo: continues from 14 Oct 07:00 with the 0.1 s delay
-MQTT_HOST=localhost python -m evstream.dashboard.app                     # terminal 2
-MQTT_HOST=localhost python -m evstream.publisher --resume               # terminal 3
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-After ingesting, stop the subscriber and run `python -m evstream.db --compact` (rewrites the file
-without the free blocks left by the many small upserts; 226 MB -> 192 MB) and `python -m evstream.verify`.
+On macOS or Linux:
 
-Every publishing run is recorded in `data/stream/publish_runs.jsonl` (mode, delay, seq range,
-message count), and `verify` reports the backfill and live totals. To rehearse the demo more than
-once, copy `data/db/ev_chargers.duckdb` and `data/stream/publisher_checkpoint.json` before the
-rehearsal and restore both afterwards.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
-## Task 1 - synthetic data generation
+In each later terminal, activate the same environment before running a Python command:
 
-* **Station list** (`stations.py`). Every A1 charger becomes one generator station:
-  `station_id = charger_id` (so each event maps back to A1 without a lookup table), coordinates
-  from `charging_site`, `connectors = number_of_plugs`, `max_kw =` highest parsed power component,
-  `site_type = urban` for Greater Sydney and the Newcastle/Illawarra SA4s, otherwise `regional`.
-* **Two simulation groups** (`generation.py`). The generator is calibrated on ARENA DC fast-charging
-  data. DC chargers (incl. the 98 *Upcoming* 350 kW sites) use the generator defaults
-  (4/3 sessions per connector per day urban/regional, meter every 2 min). AC destination chargers
-  are used far less, so they use 1.0/0.6 sessions per connector per day and a meter reading every
-  10 min. Both groups use the same 14-day window (1-14 Oct 2026) and the same real AEMO NSW1
-  wholesale prices (336/336 hours covered).
-* **Result**: 1,926 chargers, 647,136 hourly prices, 135,855 sessions, 1,707,161 meter readings.
-  Generated averages: DC urban 29.7 min / 25.4 kWh, DC regional 27.1 min / 25.3 kWh
-  (ARENA 2023: 27.3 / 27.0 and 25.9 / 24.5).
+```powershell
+# Conda
+conda activate comp5339-a2
 
-## Task 2 - event stream and MQTT publishing
+# OR Windows venv
+.\.venv\Scripts\Activate.ps1
+```
 
-`stream.py` prepares the time series for publishing:
+```bash
+# OR macOS/Linux venv
+source .venv/bin/activate
+```
 
-1. `price_update` - only **actual price changes** per charger (647,136 hourly rows -> 448,758 changes;
-   the first price of each charger is always sent).
-2. `session_start` - at plug-in, with only the facts known then (connector, vehicle, tariff).
-3. `meter` - each meter reading (voltage, current, power, cumulative kWh, SoC).
-4. `session_end` - at unplug, with totals (energy, average/peak kW, cost).
+Confirm that the required packages are available:
 
-All events are merged and sorted by event time (ties: price -> start -> meter -> end) and numbered
-with a global `seq`. The stream is checked for unique `event_id`s and that no meter/end precedes its
-start.
+```powershell
+python --version
+python -c "import duckdb, paho.mqtt.client, dash; print('dependencies OK')"
+```
 
-**Topic design**: `COMP5339/TUT19_G07/ev/<charger_id>/<event_type>`, so a client can subscribe to
-everything (`.../ev/+/+`), one event type (`.../ev/+/meter`) or one charger (`.../ev/42/#`).
-A retained `COMP5339/TUT19_G07/status/publisher` message with a last-will shows whether the
-publisher is online.
+Install DuckDB's spatial extension once if necessary:
 
-**Message format** (JSON envelope, `v` = schema version):
+```powershell
+python -c "import duckdb; duckdb.connect().execute('INSTALL spatial')"
+```
+
+## Summary execution order
+
+Run the preparation commands once when rebuilding the dataset:
+
+```powershell
+python -m evstream.stations
+python -m evstream.generation
+python -m evstream.stream
+python -m evstream.db --reset
+```
+
+For each live local run, start the components in this order:
+
+```text
+1. Mosquitto broker
+2. Dashboard with embedded MQTT subscriber
+3. MQTT publisher
+4. Open http://127.0.0.1:8050
+```
+
+If the generated files already exist, do not rerun the four preparation commands. Apply non-destructive schema updates with `python -m evstream.db`, then start the three live components.
+
+### 1. Initialise the A2 database
+
+```powershell
+python -m evstream.db
+```
+
+This applies the schema without deleting stored events. To discard all A2 events and rebuild from the A1 copy, stop the dashboard first and run:
+
+```powershell
+python -m evstream.db --reset
+```
+
+### 2. Install and start Mosquitto
+
+Install the local MQTT broker if it is not already available:
+
+```powershell
+winget install --id EclipseFoundation.Mosquitto -e
+```
+
+Open a dedicated terminal in the repository directory and start it:
+
+```powershell
+& "C:\Program Files\mosquitto\mosquitto.exe" -c .\mosquitto\mosquitto.conf
+```
+
+If Mosquitto was installed elsewhere, replace the executable path. If `mosquitto` is already on `PATH`, the shorter command is:
+
+```powershell
+mosquitto -c .\mosquitto\mosquitto.conf
+```
+
+### 3. Start the dashboard and embedded subscriber
+
+Open a second terminal in the repository directory. Activate whichever Python environment you created, then run:
+
+```powershell
+python -m evstream.dashboard.app --mqtt-host localhost --mqtt-port 1883
+```
+
+Open <http://127.0.0.1:8050>. The dashboard process starts a background MQTT subscriber and writes received events to DuckDB.
+
+### 4. Publish a demonstration window
+
+Open a third terminal in the repository directory. Activate the same environment, then run:
+
+```powershell
+python -m evstream.publisher `
+    --host localhost `
+    --from "2026-10-01 09:00" `
+    --until "2026-10-01 13:00"
+```
+
+## Current dataset
+
+The configuration in `evstream/config.py` generates one simulated day:
+
+```python
+SIM_START = "2026-10-01"
+SIM_DAYS = 1
+```
+
+| Output | Count |
+|---|---:|
+| Chargers | 1,926 |
+| Hourly prices | 46,224 |
+| Charging sessions | 9,576 |
+| Meter readings | 120,093 |
+| Price-change events | 32,742 |
+| Complete event stream | 171,987 |
+
+Sessions and prices are generated for 1 October 2026. A late session can finish after midnight on 2 October; that is a spill-over session, not a second generated day.
+
+The complete stream takes about 4 hours 47 minutes at 0.1 seconds per event, so a demonstration normally publishes a smaller continuous simulated-time window.
+
+## Assignment 1 audit and station preparation
+
+`A1_charger_check.ipynb` is a read-only data-quality audit. It reports problems in the Assignment 1 source, including missing charger types, missing power ratings, type/rating conflicts and missing generator-required attributes. The notebook deliberately does not fill values, transform records or produce generator input.
+
+The production solution is `evstream/stations.py`. It reads the normalized A1 tables and prepares every charger for the supplied generator by:
+
+- retaining `charger_id` as `station_id`;
+- deriving a display name from operator and address because A1 has no station-name field;
+- joining coordinates and geographic classifications;
+- deriving the urban/regional `site_type` used by the generator;
+- ensuring a usable connector count;
+- selecting the highest recorded charger rating;
+- filling missing AC ratings with the observed A1 AC median;
+- inferring missing AC/DC simulation types from the available rating;
+- recording whether power came from A1 or from the documented default.
+
+The data-generation workflow is therefore:
+
+```text
+A1_charger_check.ipynb       documents source-data problems only
+          |
+          v
+evstream/stations.py         applies the production preparation rules
+          |
+          +--> stations_input_ac.csv
+          `--> stations_input_dc.csv
+                         |
+                         v
+evstream/generation.py       runs the supplied generator from those inputs
+```
+
+The generator does not query or modify the A1 database directly. Its station population is based on the two input files written by `stations.py`.
+
+Run the station preparation and data generation from the repository directory:
+
+```powershell
+python -m evstream.stations
+python -m evstream.generation
+```
+
+The first command writes the AC/DC station inputs. The second command passes those files to the supplied generator and merges its station, hourly-price, session and metering outputs into `data/generated`.
+
+## Rebuild generated data
+
+The generated outputs are already included. To reproduce them:
+
+```powershell
+# A1 charger records -> AC and DC simulator inputs
+python -m evstream.stations
+
+# Run the provided generator and merge AC/DC outputs
+python -m evstream.generation
+
+# CSV data -> ordered Parquet and JSONL stream
+python -m evstream.stream
+
+# Fresh A1 working copy with empty A2 event tables
+python -m evstream.db --reset
+```
+
+Generation parameters are:
+
+| Group | Urban sessions/connector/day | Regional sessions/connector/day | Meter interval |
+|---|---:|---:|---:|
+| DC | 4.0 | 3.0 | 2 minutes |
+| AC | 1.0 | 0.6 | 10 minutes |
+
+Both groups use the same day and AEMO NSW1 wholesale-price series. Their outputs are merged into `data/generated`.
+
+## Publishing options
+
+```powershell
+# Complete stream
+python -m evstream.publisher --host localhost
+
+# First 100 messages
+python -m evstream.publisher --host localhost --limit 100
+
+# Continue after the saved acknowledged sequence
+python -m evstream.publisher --host localhost --resume
+
+# Send all events through the local broker without the artificial delay
+python -m evstream.publisher --host localhost --backfill
+```
+
+Backfill still sends JSON through Mosquitto and the subscriber still validates and stores every message. It only removes the 0.1-second demonstration delay. It is restricted to a local broker and recorded in `data/stream/publish_runs.jsonl`.
+
+### Window bootstrap
+
+When `--from` is supplied, the publisher first sends:
+
+- each charger's latest earlier price event;
+- the start event of each session already active at the window boundary.
+
+These are unchanged original events. They give the dashboard the state needed to interpret the selected window. The publisher then sends all events inside the window in sequence order. Use `--no-bootstrap` only when deliberately testing a raw window.
+
+Progress is stored in `data/stream/publisher_checkpoint.json`.
+
+## MQTT stream
+
+The topic format is:
+
+```text
+COMP5339/TUT19_G07/ev/<charger_id>/<event_type>
+```
+
+| Event type | Meaning |
+|---|---|
+| `price_update` | Customer and wholesale tariff update |
+| `session_start` | Vehicle connected and session began |
+| `meter` | Voltage, current, power, cumulative energy and state of charge |
+| `session_end` | Final energy, duration, power and cost |
+
+The publisher reads `events.parquet`, but sends its `message` column as JSON. Parquet itself is not sent through MQTT. `events.jsonl` contains the same complete stream in human-readable form.
+
+Example:
 
 ```json
-{"v": 1, "seq": 23766, "event_id": "m-24-2-202610010719-202610010801", "event_type": "meter",
- "event_ts": "2026-10-01T08:01:00+10:00", "charger_id": 24, "connector_id": 2,
- "session_id": "24-2-202610010719",
- "data": {"voltage_v": 722.9, "current_a": 68.1, "power_kw": 49.22, "energy_kwh": 34.177, "soc_pct": 70.5}}
+{
+  "v": 1,
+  "seq": 1927,
+  "event_id": "ss-1846-1-202610010000",
+  "event_type": "session_start",
+  "event_ts": "2026-10-01T00:00:00+10:00",
+  "charger_id": 1846,
+  "connector_id": 1,
+  "session_id": "1846-1-202610010000",
+  "data": {
+    "vehicle_model": "Tesla Model Y",
+    "price_per_kwh": 0.46
+  }
+}
 ```
 
-See `data/stream/events_sample.jsonl` for examples of all four types.
+Events are sorted by simulated timestamp. Ties use:
 
-**Publisher** (`publisher.py`): QoS 1; at least 0.1 s between messages (monotonic-clock
-schedule); waits for the connection and auto-reconnects; at most 200 un-acknowledged messages;
-the checkpoint only advances to the highest seq whose PUBACK was received, so `--resume` never
-skips a message. When replaying from `--from`, it first re-sends the latest price of every
-charger and the start of every session still active at that time (bootstrap), so the dashboard
-is consistent immediately. `--backfill` disables the delay for pre-loading history (local broker
-only, logged in `publish_runs.jsonl`); without it, a delay below 0.1 s is rejected.
+```text
+price_update -> session_start -> meter -> session_end
+```
 
-## Tasks 3 and 4 - subscription, storage and integration
+`seq` is the global publishing order. `event_id` is the stable identity used for MQTT QoS 1 de-duplication.
 
-`ingest.py` subscribes with QoS 1 and a persistent session (`clean_session=False`), decodes and
-validates each message (envelope keys, version, event type, topic matches payload, `charger_id`
-exists in A1), and queues it. A writer thread stores batches (every 0.5 s or 500 events) in one
-DuckDB transaction. Invalid messages go to `data/stream/rejected.jsonl`. Re-delivered messages are
-dropped by `event_id`.
+## Subscription and ingestion
 
-Schema extension (`sql/02_schema_a2_events.sql`), all linked to A1 `charger(charger_id)`:
+Normal live mode runs the subscriber and dashboard together:
 
-| Table | Content | Key design choices |
-|---|---|---|
-| `event_log` | one row per distinct MQTT event | PK `seq` (idempotent ingest; 1:1 with `event_id`), arrival time |
-| `price_event` | tariff changes | PK (`charger_id`, `event_ts`), FK to A1 charger, wholesale price kept |
-| `charging_session` | one row per session | FK to A1 charger; inserted at start, completed at end; `end_ts IS NULL` = active |
-| `meter_reading` | session telemetry | FK to session (charger via session), REAL columns |
-| `charger_live_state` | current price, active sessions, last event per charger | FK to A1 charger; maintained in the same transaction |
+```text
+one dashboard process
+|-- Paho MQTT background thread
+|   `-- receives COMP5339/TUT19_G07/ev/+/+
+|-- EventIngestor
+|   `-- validates and writes DuckDB transactions
+|-- Dash callbacks
+|   `-- poll committed state every 2.5 seconds
+`-- one DuckDB database file
+```
 
-Views: `v_charger_live` (A1 attributes + live state), `v_active_sessions` (current state),
-`v_charger_usage_daily` (sessions, kWh, revenue, utilisation per charger and day),
-`v_network_hourly`.
+Each new message is processed atomically:
 
-Physical design (measured on the 2.27 M-event database):
+```text
+BEGIN
+  validate envelope and event-specific fields
+  insert immutable event_log row
+  insert typed event row
+  update charger_live_state
+COMMIT
+acknowledge the QoS 1 MQTT message
+```
 
-* Events are inserted in event-time order, so DuckDB's row-group min/max zonemaps prune
-  time-range scans without an index.
-* DuckDB creates an ART index for every primary and foreign key. The foreign-key indexes already
-  serve the pop-up's point look-ups (meter readings by session, sessions and prices by charger:
-  0.2 ms instead of 1.5 ms), so extra `CREATE INDEX` statements were removed (each added ~45 MB).
-* `event_log` is keyed by the BIGINT `seq` instead of the VARCHAR `event_id`: index 19 MB instead
-  of 128 MB. `meter_reading` has no composite key (+80 MB); its uniqueness is guaranteed by the
-  `event_log` check in the same transaction.
-* `charger_live_state` lets the map refresh read 1,926 rows instead of aggregating the history;
-  `v_active_sessions` filters meter readings to active sessions before aggregating.
-* Result: 699 MB for the first design -> 192 MB after redesign and compaction, same data and checks.
-If a meter arrives before its `session_start` (e.g. subscriber joined late), a placeholder session
-is created (`start_inferred = true`) and completed by later events.
+An identical redelivery is returned as a duplicate and not inserted again. A conflicting message that reuses an existing `event_id` is rejected.
 
-## Task 3 - dashboard
+For headless ingestion without the dashboard:
 
-`python -m evstream.dashboard.app` (Dash + dash-leaflet) refreshes every 2.5 s:
+```powershell
+python -m evstream.subscriber --host localhost --port 1883
+```
 
-* **Map**: a marker appears for a charger when its first event arrives. Each marker shows the
-  **live price** and is coloured by **occupancy** (green free, amber partly busy, red full);
-  `⚡n/m` = active sessions / connectors. Clusters show the number of chargers and of busy chargers.
-  Filters: operator, charger type, show chargers without events.
-* **Pop-up on click**: operator network, address, charger type and power, plug types, area,
-  status, latest price; *current state*: connectors in use and power delivered now;
-  *historical*: sessions, energy and utilisation over the last 7 simulated days; a **live-updated
-  charging curve** (energy, power, SoC) of the active session(s) from the stored meter events, and
-  the charger's price history.
-* **KPIs**: simulated time, active sessions, chargers in use, MW delivered now, average live price
-  (current state); sessions completed, MWh delivered, revenue (historical).
-* Side panel: hourly sessions and tariff (stored history), top chargers by energy, live event feed.
+Do not run the standalone subscriber and embedded dashboard subscriber together. To view an existing database without subscribing:
 
-## Outputs and included data
+```powershell
+python -m evstream.dashboard.app --no-ingest
+```
+
+## Database design
+
+The original `data/a1/ev_chargers_a1.duckdb` is not modified. `evstream.db` copies it to `data/db/ev_chargers.duckdb` and applies the A2 schema to that working copy.
+
+A1 contains operator names and addresses but no independent charger-name attribute. The A2 copy adds `charger.charger_name` using the same display name supplied to the simulator:
+
+```text
+<operator> - <address>
+```
+
+| Object | Purpose |
+|---|---|
+| `charger.charger_name` | Generator-compatible display name in the A2 copy |
+| `event_log` | Immutable envelope and canonical JSON for each unique event |
+| `price_event` | Customer and wholesale price history |
+| `charging_session_core` | Stable session, charger and connector identity |
+| `session_start_event` | Immutable session-start fact |
+| `meter_reading` | Append-only telemetry |
+| `session_end_event` | Immutable final session facts |
+| `charger_live_state` | Current price, active-session count and latest event time |
+| `charging_session` | View combining the session tables |
+| `v_charger_live` | A1 details plus current streamed state |
+| `v_active_sessions` | Active sessions and their latest meter reading |
+| `v_charger_usage_daily` | Completed usage grouped by charger and day |
+| `v_network_hourly` | Hourly session starts, delivered energy and average tariff |
+
+Historical event tables are append-only. Only `charger_live_state` is updated, allowing fast current-state dashboard queries.
+
+## Dashboard information
+
+The dashboard includes a charger map, live network metrics, stored historical metrics, charging curves, price history, hourly network activity, top chargers and a recent-event feed.
+
+Each charger panel explicitly displays:
+
+- **Name**, when applicable: the generator-compatible display name;
+- **Address** from the A1 charging site;
+- **Operator** network from A1;
+- **Plug types** from A1;
+- **Latest price** received from MQTT and its simulated update time;
+- charger ID, type, maximum power, connector count, area and status.
+
+Historical labels refer to **stored streamed history**, not a fixed seven-day dataset. With the current one-day simulation, charts show only events actually received for that day and any late session completions. No unavailable days are fabricated.
+
+## Project structure
+
+```text
+COMP5339_ASS2/
+|-- README.md
+|-- A1_charger_check.ipynb
+|-- requirements.txt
+|-- mosquitto/mosquitto.conf
+|-- generator/generate_dataset.py
+|-- sql/02_schema_a2_events.sql
+|-- evstream/
+|   |-- config.py
+|   |-- stations.py
+|   |-- generation.py
+|   |-- stream.py
+|   |-- publisher.py
+|   |-- subscriber.py
+|   |-- ingest.py
+|   |-- db.py
+|   `-- dashboard/
+`-- data/
+    |-- a1/ev_chargers_a1.duckdb
+    |-- generated/
+    |-- stream/
+    `-- db/ev_chargers.duckdb
+```
+
+## Important outputs
 
 | Path | Description |
 |---|---|
-| `data/generated/stations_input.csv` (+ `_dc`, `_ac`) | generator input built from A1 (with power source and group) |
-| `data/generated/stations.csv` | stations with the generator's base price |
-| `data/generated/prices_hourly.csv` | hourly dynamic price per charger with AEMO wholesale price |
-| `data/generated/sessions.csv` | one row per charging session |
-| `data/generated/session_metering.csv` | meter readings of all sessions |
-| `data/generated/aemo_cache/` | downloaded AEMO NSW1 5-minute price file |
-| `data/stream/events.parquet` | the complete ordered event stream incl. each JSON message |
-| `data/stream/events_sample.jsonl` | 500 consecutive messages, readable |
-| `data/stream/publisher_checkpoint.json` | last acknowledged seq of the last publishing run |
-| `data/stream/publish_runs.jsonl` | one line per publishing run (backfill or live, delay, seq range) |
-| `mosquitto/mosquitto.conf` | local broker configuration (no message drops) |
-| `data/db/ev_chargers.duckdb` | A1 database extended with the stored MQTT events |
+| `data/generated/stations_input_ac.csv` | A1 AC chargers prepared for simulation |
+| `data/generated/stations_input_dc.csv` | A1 DC chargers prepared for simulation |
+| `data/generated/stations.csv` | Merged generated stations |
+| `data/generated/prices_hourly.csv` | Hourly customer and wholesale prices |
+| `data/generated/sessions.csv` | Generated sessions |
+| `data/generated/session_metering.csv` | Session telemetry |
+| `data/stream/events.parquet` | Ordered stream and JSON messages |
+| `data/stream/events.jsonl` | Complete JSON Lines stream |
+| `data/stream/publisher_checkpoint.json` | Latest acknowledged sequence |
+| `data/stream/publish_runs.jsonl` | Publisher run audit log |
+| `data/db/ev_chargers.duckdb` | A1 copy extended with A2 events |
+
 
 ## Assumptions
 
-* Prices follow the generator's hypothetical dynamic tariff (NRMA itself uses flat prices).
-* Timestamps are AEMO market time (AEST, UTC+10, no daylight saving), as in the AEMO data.
-* The 98 *Upcoming* chargers (no AC/DC type, 350 kW) are simulated as commissioned DC sites so that
-  every A1 charger has data.
-* 518 AC chargers without a power rating use the median A1 AC rating (22 kW).
-* AC utilisation (1.0/0.6 sessions per connector per day) is our assumption; the generator's
-  vehicle model is designed for DC charging, so AC sessions are limited only by the charger rating.
-* Session occupancy (for "in use") lasts until unplug (`end_ts`), not only until charging stops.
-* Publishing the complete stream (2.43 M messages) at 0.1 s takes about 67 hours. The history
-  (1-14 Oct 07:00) was therefore backfilled through MQTT without the delay (see "How the submitted
-  database was filled"); live streaming always uses the ≥ 0.1 s delay. The publisher can also
-  publish the full stream at 0.1 s, resuming across several runs with `--resume`.
-
-## Known limitations
-
-* DuckDB allows one writing process, so the subscriber is embedded in the dashboard process.
-* The public broker is shared and unauthenticated; use a local Mosquitto broker for long runs.
-* Chargers sharing a site have identical coordinates; their markers are spread out ("spiderfied")
-  when the cluster is clicked at maximum zoom.
+- Generated `station_id` equals the A1 `charger_id`.
+- Site type controls generator calibration but is not included in MQTT payloads or stored as an A2 event attribute.
+- The 518 AC chargers missing an A1 rating use the median AC rating of 22 kW for simulation.
+- One connector can serve at most one vehicle at a time.
+- Occupancy continues until unplug time (`end_ts`), including post-charge idle time.
+- Meter `energy_kwh` is cumulative; interval energy is derived from consecutive readings.
+- Simulation timestamps use fixed AEST (UTC+10), matching the generator's market-time handling.
