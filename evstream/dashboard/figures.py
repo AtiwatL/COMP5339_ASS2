@@ -48,6 +48,7 @@ def charging_curve(readings, live, uirevision="keep"):
     if readings.empty:
         return empty("no meter readings stored")
 
+    # Separate unlike units while sharing time, so power does not flatten energy or SoC.
     fig = make_subplots(
         rows=3,
         cols=1,
@@ -58,6 +59,7 @@ def charging_curve(readings, live, uirevision="keep"):
     sessions = readings.groupby(["connector_id", "session_id"], sort=True)
     measures = (("energy_kwh", "kWh"), ("power_kw", "kW"), ("soc_pct", "%"))
 
+    # A connector/session keeps the same colour in all three panels and one legend entry.
     for i, ((connector, _), session) in enumerate(sessions):
         color = SERIES[i % len(SERIES)]
         vehicle = session["vehicle_model"].iloc[0]
@@ -81,8 +83,7 @@ def charging_curve(readings, live, uirevision="keep"):
                 col=1,
             )
 
-    # A fixed 0-100 axis makes a short replay look flat. Zoom to the observed
-    # SoC band while retaining context and never exceeding physical bounds.
+    # Zoom to the observed SoC band while retaining context and never exceeding physical bounds.
     soc = readings["soc_pct"].dropna()
     if len(soc):
         low, high = float(soc.min()), float(soc.max())
@@ -97,9 +98,6 @@ def charging_curve(readings, live, uirevision="keep"):
     fig.update_annotations(font=dict(size=11, color=TEXT_SECONDARY), x=0, xanchor="left")
     _style(fig, 350)
     fig.update_layout(
-        # Keep the connector/vehicle identity visible even when only one
-        # session is plotted; otherwise the vehicle model is discoverable only
-        # by inspecting the underlying event data.
         showlegend=True,
         legend=dict(y=1.03, yanchor="bottom", yref="container"),
         margin=dict(t=60),
@@ -114,6 +112,7 @@ def price_history(prices, now, uirevision="keep"):
     if prices.empty:
         return empty("no price events stored")
 
+    # Extend the final step to simulated "now" without inventing another price event.
     x = list(prices["ts"]) + [now]
     tariff = list(prices["price_per_kwh"]) + [prices["price_per_kwh"].iloc[-1]]
     wholesale = list(prices["wholesale_per_kwh"]) + [prices["wholesale_per_kwh"].iloc[-1]]
@@ -161,6 +160,7 @@ def network_hourly(hourly):
     """Stored session starts and their average locked tariff by simulated hour."""
     if hourly.empty:
         return empty("no session starts stored")
+    # Counts and tariffs use separate panels because their scales and units differ.
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.14,
         row_heights=[0.6, 0.4],
@@ -189,6 +189,7 @@ def top_chargers(top):
     """Horizontal ranking using kWh so short replay windows retain useful precision."""
     if top.empty:
         return empty("no completed sessions stored")
+    # Reverse descending query results so the largest horizontal bar appears at the top.
     top = top.iloc[::-1]
     labels = [
         f"#{row.charger_id} {'' if pd.isna(row.operator_name) else str(row.operator_name)[:18]}"

@@ -95,10 +95,12 @@ body {
               text-transform: uppercase; letter-spacing: .04em; }
 .ev-metric-row { display: flex; gap: 8px; }
 .ev-metric { flex: 1 1 0; background: var(--surface-0); border: 1px solid #ebeae6;
-             border-radius: 8px; padding: 8px 10px; min-width: 0; }
+             border-radius: 8px; padding: 8px 10px; min-width: 0; box-sizing: border-box; }
 .ev-metric-label { font-size: 11px; color: var(--text-muted); }
-.ev-metric-value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ev-metric-value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums;
+                   line-height: 1.15; overflow-wrap: anywhere; }
 .ev-metric-sub { font-size: 11px; color: var(--text-muted); }
+.ev-popup .ev-metric-value { font-size: 14px; letter-spacing: -.015em; }
 .ev-dot-free { background: var(--good); } .ev-dot-partial { background: var(--warning); }
 .ev-dot-full { background: var(--critical); } .ev-dot-none { background: var(--idle); }
 .ev-metric .ev-dot { display: inline-block; vertical-align: 1px; }

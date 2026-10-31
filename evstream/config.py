@@ -1,8 +1,8 @@
 """Shared settings for every pipeline stage.
 
 All paths are resolved relative to the project root so the scripts work from any
-working directory. Broker settings can be overridden with environment variables
-(MQTT_HOST, MQTT_PORT, MQTT_TOPIC_ROOT) or with command-line flags.
+working directory. MQTT uses the fixed local broker at localhost:1883; only the
+topic root can be overridden with MQTT_TOPIC_ROOT.
 """
 import os
 import signal
@@ -29,17 +29,18 @@ DB_PATH = PROJECT_ROOT / "data" / "db" / "ev_chargers.duckdb"     # A1 database 
 SCHEMA_A1_SQL = PROJECT_ROOT / "sql" / "01_schema_a1.sql"
 SCHEMA_A2_SQL = PROJECT_ROOT / "sql" / "02_schema_a2_events.sql"
 
-# Simulation window: at least two weeks of recent AEMO NSW1 prices.
+# Simulation window: one day of AEMO NSW1-based synthetic activity.
 SIM_START = "2026-10-01"
 SIM_DAYS = 1
 
-# MQTT. The public HiveMQ broker is the one used in the Week 9 tutorial; a local
-# Mosquitto broker (MQTT_HOST=localhost) is recommended for long, full-stream runs.
-MQTT_HOST = os.environ.get("MQTT_HOST", "broker.hivemq.com")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+# MQTT always connects to the local Mosquitto listener.
+MQTT_HOST = "localhost"
+MQTT_PORT = 1883
 TOPIC_ROOT = os.environ.get("MQTT_TOPIC_ROOT", "COMP5339/TUT19_G07/ev")
 QOS = 1                      # at-least-once delivery; duplicates are removed by event_id on ingest
 MIN_PUBLISH_DELAY_S = 0.1    # assignment requirement: at least 0.1 s between published messages
+
+
 
 EVENT_TYPES = ("price_update", "session_start", "meter", "session_end")
 # Tie-break order for events that share a timestamp: a session must start before its first

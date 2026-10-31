@@ -15,9 +15,19 @@ def sim_now(cur):
 
 
 def filter_options(cur):
+    """Return distinct A1 operator and charger-type values for the map controls."""
     operators = [r[0] for r in cur.execute("""
         SELECT DISTINCT operator_name FROM v_charger_live WHERE operator_name IS NOT NULL ORDER BY 1""").fetchall()]
-    types = [r[0] for r in cur.execute("SELECT DISTINCT charger_type FROM v_charger_live ORDER BY 1").fetchall()]
+    # A1 has chargers with no recorded type.  Give those NULL values an explicit
+    # user-facing category so they remain available through the type filter.
+    types = [
+        {"label": charger_type, "value": charger_type}
+        for (charger_type,) in cur.execute("""
+            SELECT DISTINCT coalesce(charger_type, 'Unknown type') AS charger_type_filter
+            FROM v_charger_live
+            ORDER BY charger_type_filter
+        """).fetchall()
+    ]
     return operators, types
 
 
@@ -30,8 +40,9 @@ def map_points(cur, operators=None, types=None, include_idle=False):
         where.append("operator_name IN (SELECT unnest(?))")
         params.append(list(operators))
     if types:
-        where.append("charger_type IN (SELECT unnest(?))")
+        where.append("coalesce(charger_type, 'Unknown type') IN (SELECT unnest(?))")
         params.append(list(types))
+    # Build only the WHERE clause dynamically; filter values remain bound parameters.
     sql = f"SELECT {LIVE_COLUMNS} FROM v_charger_live"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -48,6 +59,7 @@ def live_signature(cur):
 # ---------------------------------------------------------------- pop-up (one charger)
 
 def charger_detail(cur, charger_id):
+    """Return A1 attributes plus the latest streamed state for one charger."""
     df = cur.execute(f"SELECT {LIVE_COLUMNS} FROM v_charger_live WHERE charger_id = ?", [charger_id]).df()
     return df.iloc[0].to_dict() if len(df) else None
 
@@ -63,6 +75,7 @@ def charger_current(cur, charger_id, now):
 
 def charger_history(cur, charger_id):
     """Completed metrics over all stored stream history for one charger."""
+    # The denominator uses the actual stored event span, so partial replays are not treated as full days.
     return cur.execute("""
         WITH span AS (
             SELECT greatest(date_diff('minute', min(event_ts), max(event_ts)), 1) AS minutes
@@ -86,6 +99,7 @@ def session_curves(cur, charger_id):
         WHERE charger_id = ? AND end_ts IS NULL ORDER BY connector_id""", [charger_id]).df()
     live = len(sessions) > 0
     if not live:
+        # A completed fallback keeps the chart useful when no connector is currently occupied.
         sessions = cur.execute("""
             SELECT session_id, connector_id, vehicle_model, start_ts, end_ts FROM charging_session
             WHERE charger_id = ? ORDER BY start_ts DESC LIMIT 1""", [charger_id]).df()
@@ -109,6 +123,7 @@ def price_history(cur, charger_id):
 
 def kpis(cur, now):
     """Current state plus completed metrics over all stored streamed history."""
+    # Current values come from compact state tables/views rather than scanning event history.
     current = cur.execute("""
         SELECT sum(active_sessions) AS active_sessions,
                count(*) FILTER (WHERE active_sessions > 0) AS chargers_in_use,
@@ -117,6 +132,7 @@ def kpis(cur, now):
                (SELECT coalesce(sum(power_kw), 0) / 1000 FROM v_active_sessions
                 WHERE last_meter_ts >= ? - INTERVAL 12 MINUTE) AS mw_now
         FROM charger_live_state""", [now]).df().iloc[0].to_dict()
+    # Historical totals include completed sessions only, because their energy and cost are final.
     hist = cur.execute("""
         SELECT count(*) AS sessions, coalesce(sum(energy_kwh), 0) / 1000 AS mwh,
                coalesce(sum(cost_aud), 0) AS revenue_aud
@@ -125,6 +141,7 @@ def kpis(cur, now):
 
 
 def network_hourly(cur, now, hours=48):
+    """Return stored hourly activity within the configured recent simulated-time window."""
     return cur.execute("""
         SELECT hour, sessions_started, energy_kwh, avg_session_price
         FROM v_network_hourly WHERE hour > ?::TIMESTAMP - to_hours(?::INTEGER) AND hour <= ?

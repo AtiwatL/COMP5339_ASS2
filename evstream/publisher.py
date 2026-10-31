@@ -23,8 +23,8 @@ mode, delay and seq range, is appended to data/stream/publish_runs.jsonl.
 
 Run:  python -m evstream.publisher                              # full stream from the beginning
       python -m evstream.publisher --from "2026-10-01 07:30"    # replay from 07:30 on day 1
-      python -m evstream.publisher --resume                     # continue after the last checkpoint
-      python -m evstream.publisher --backfill --until "2026-10-14 07:00" --host localhost
+      python -m evstream.publisher --resume                     # continue after the checkpoint
+      python -m evstream.publisher --backfill --until "2026-10-01 07:00"
 """
 import argparse
 import json
@@ -38,7 +38,6 @@ from evstream import config
 
 STATUS_TOPIC = config.TOPIC_ROOT.rsplit("/", 1)[0] + "/status/publisher"
 MAX_INFLIGHT = 200
-LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
 class Publisher:
@@ -123,7 +122,8 @@ def save_checkpoint(seq, args):
 
 def log_run(args, pub, first_seq, last_acked, started, all_acked):
     """Append one line per publishing run, so it is always documented how the database was filled."""
-    entry = {"mode": "backfill" if args.backfill else "live", "host": args.host, "delay_s": pub.delay,
+    entry = {"mode": "backfill" if args.backfill else "live", "host": config.MQTT_HOST,
+             "delay_s": pub.delay,
              "from": args.from_ts, "until": args.until, "resumed": args.resume,
              "first_seq": first_seq, "last_acked_seq": last_acked, "messages": pub.published,
              "all_acknowledged": all_acked, "started": started, "finished": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -162,8 +162,6 @@ def build_query(args, start_after_seq):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--host", default=config.MQTT_HOST)
-    ap.add_argument("--port", type=int, default=config.MQTT_PORT)
     ap.add_argument("--delay", type=float, default=config.MIN_PUBLISH_DELAY_S,
                     help="seconds between messages (minimum 0.1)")
     ap.add_argument("--from", dest="from_ts", help="first event time to replay, e.g. '2026-10-01 07:30'")
@@ -176,8 +174,6 @@ def main():
     args = ap.parse_args()
     config.stop_on_sigterm()
     if args.backfill:
-        if args.host not in LOCAL_HOSTS:
-            ap.error("--backfill is only allowed against a local broker (--host localhost), see README")
         args.delay = 0.0
         print("*** BACKFILL MODE: loading history without the 0.1 s delay (recorded in publish_runs.jsonl) ***")
     elif args.delay < config.MIN_PUBLISH_DELAY_S:
@@ -194,8 +190,9 @@ def main():
             print(f"resuming after seq {start_after:,}")
 
     cur = duckdb.connect().execute(build_query(args, start_after))
-    pub = Publisher(args.host, args.port, args.delay)
-    print(f"[publisher] {args.host}:{args.port}  topic {config.TOPIC_ROOT}/<charger_id>/<event_type>  "
+    pub = Publisher(config.MQTT_HOST, config.MQTT_PORT, args.delay)
+    print(f"[publisher] {config.MQTT_HOST}:{config.MQTT_PORT}  "
+          f"topic {config.TOPIC_ROOT}/<charger_id>/<event_type>  "
           f"delay {pub.delay}s")
     last_seq, t_next, t0 = start_after, time.monotonic(), time.monotonic()
     first_seq, started = None, time.strftime("%Y-%m-%d %H:%M:%S")

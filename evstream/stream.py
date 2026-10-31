@@ -1,6 +1,6 @@
 """Task 2a - turn the generated time series into one ordered stream of MQTT-ready events.
 
-Preparation steps (all done in DuckDB, so 2.5 million rows are processed in seconds):
+Preparation steps (all done in DuckDB):
 
 1. price_update  - from prices_hourly.csv. Only *changes* are kept: a row is emitted when the
                    price differs from the same charger's previous hourly price (the first price of
@@ -114,12 +114,18 @@ COPY (
 
 
 def build_stream():
+    """Build, validate and export the ordered MQTT-ready event stream."""
+    # Create the output directory independently of the caller's working directory.
     config.STREAM_DIR.mkdir(parents=True, exist_ok=True)
     out = config.STREAM_DIR / "events.parquet"
     con = duckdb.connect()
+
+    # Convert the generated CSV records into one temporary, event-time-ordered table,
+    # then serialize each row as JSON and write the publisher's compressed Parquet input.
     con.execute(STREAM_SQL.replace("{gen}", config.GENERATED_DIR.as_posix()))
     con.execute(MESSAGE_SQL.replace("{out}", out.as_posix()))
 
+    # Summarise the completed stream and ensure every event has a stable unique identity.
     checks = con.execute("""
         SELECT count(*) AS events,
                count(DISTINCT event_id) AS unique_ids,
@@ -130,6 +136,8 @@ def build_stream():
     print(f"{checks[0]:,} events for {checks[4]:,} chargers, {checks[2]} -> {checks[3]}")
     print(con.execute("""
         SELECT event_type, count(*) AS events FROM ev GROUP BY 1 ORDER BY min(seq)""").df().to_string(index=False))
+
+    # Report how many hourly price rows remain after unchanged tariffs are removed.
     raw_prices = con.execute(
         f"SELECT count(*) FROM read_csv_auto('{config.GENERATED_DIR.as_posix()}/prices_hourly.csv')").fetchone()[0]
     kept = con.execute("SELECT count(*) FROM ev WHERE event_type = 'price_update'").fetchone()[0]

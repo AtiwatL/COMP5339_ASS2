@@ -37,9 +37,6 @@ class Database:
 
     def __init__(self, path, read_only=True):
         self._con = duckdb.connect(str(path), read_only=read_only)
-        # The A1 tables carry RTREE indexes: a writing connection (the embedded ingest) cannot
-        # checkpoint without spatial. INSTALL is a no-op once installed (internet needed only once);
-        # cursors share the extensions loaded here.
         self._con.execute("INSTALL spatial; LOAD spatial")
         self._lock = threading.Lock()
 
@@ -52,7 +49,7 @@ class Database:
         with self._lock:
             self._con.close()
 
-
+# Translate live usage into the CSS class used to colour each map marker.
 def occupancy_class(active, connectors, has_events):
     if not has_events:
         return "none"
@@ -62,6 +59,7 @@ def occupancy_class(active, connectors, has_events):
 
 
 def to_geojson(df):
+    """Convert dashboard query rows into browser-ready GeoJSON features."""
     features = []
     for r in df.itertuples(index=False):
         price = None if _missing(r.current_price) else round(r.current_price, 2)
@@ -84,6 +82,8 @@ def to_geojson(df):
 
 
 def build_layout(db):
+    """Create the fixed page skeleton; callbacks replace only dynamic children."""
+    # Filter choices come from A1 attributes and are available before streaming starts.
     with db.cursor() as cur:
         operators, types = q.filter_options(cur)
     filters = html.Div(className="ev-filters", children=[
@@ -112,7 +112,7 @@ def build_layout(db):
     ])
     return html.Div([
         html.Div(className="ev-header", children=[
-            html.H1("NSW EV charging - live network"),
+            html.H1("NSW EV charging - Live Network"),
             html.Span(id="sim-time", className="ev-simtime"),
         ]),
         html.Div(id="kpis", className="ev-kpis"),
@@ -162,6 +162,7 @@ EVENT_LABEL = {"price_update": "price", "session_start": "plug-in", "meter": "me
 
 
 def kpi_tiles(cur, now):
+    """Render separate groups for current network state and stored history."""
     cur_kpi, hist = q.kpis(cur, now)
     reporting = int(cur_kpi["chargers_reporting"] or 0)
     return [
@@ -182,6 +183,7 @@ def kpi_tiles(cur, now):
 
 
 def feed_items(events):
+    """Render the newest stored events as compact, human-readable list items."""
     return [html.Li([
         html.Span(f"{r.event_ts:%H:%M:%S}", className="ev-feed-ts"),
         html.Span(EVENT_LABEL.get(r.event_type, r.event_type), className=f"ev-feed-type ev-feed-{r.event_type}"),
@@ -228,6 +230,7 @@ def popup_parts(cur, charger_id, now):
     if now is None:  # nothing stored yet, e.g. the dashboard was started before the publisher
         return (html.Div(facts + [html.Div("waiting for events…", className="ev-popup-sub")]), "charging curve",
                 fig.empty("no meter readings yet"), fig.empty("no price events yet"))
+    # Fetch current, historical and chart data independently so each display states its source clearly.
     cur_state = q.charger_current(cur, charger_id, now)
     in_use = int(cur_state["in_use"])
     hist = q.charger_history(cur, charger_id)
@@ -258,6 +261,8 @@ def popup_parts(cur, charger_id, now):
 
 
 def register_callbacks(app, db):
+    """Connect the 2.5-second polling tick and user actions to dashboard outputs."""
+    # Refresh the full GeoJSON layer only when live state or selected filters change.
     @app.callback(
         Output("chargers", "data"), Output("map-sig", "data"), Output("sim-time", "children"),
         Input("tick", "n_intervals"), Input("f-operator", "value"), Input("f-type", "value"),
@@ -274,6 +279,7 @@ def register_callbacks(app, db):
         return to_geojson(df), sig, sim_time
 
 
+    # Keep one selected charger ID for map clicks, popup closing and deep links.
     @app.callback(
         Output("selected", "data"),
         Input("chargers", "clickData"), Input("popup-close", "n_clicks"), Input("url", "search"),
@@ -289,6 +295,7 @@ def register_callbacks(app, db):
             return no_update
         return props.get("charger_id", no_update)
 
+    # Poll the selected charger separately so its metrics and curves can grow in place.
     @app.callback(
         Output("popup", "hidden"), Output("pp-details", "children"), Output("pp-curve-title", "children"),
         Output("pp-curve", "figure"), Output("pp-price", "figure"),
@@ -301,6 +308,7 @@ def register_callbacks(app, db):
             return (False, *popup_parts(cur, charger_id, q.sim_now(cur)))
 
 
+    # Refresh network KPIs, historical figures and the event feed in the same polling cycle.
     @app.callback(
         Output("kpis", "children"), Output("g-hourly", "figure"), Output("g-top", "figure"),
         Output("feed", "children"),
@@ -316,6 +324,7 @@ def register_callbacks(app, db):
 
 
 def create_app(db):
+    """Assemble the Dash application around an already-open database handle."""
     app = Dash(__name__, title="EV charging - live map", update_title=None)
     app.layout = build_layout(db)
     register_callbacks(app, db)
@@ -329,16 +338,11 @@ def main():
                     help="open the stored database read-only, without subscribing to MQTT")
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--mqtt-host", default=config.MQTT_HOST, help="MQTT broker hostname")
-    ap.add_argument("--mqtt-port", type=int, default=config.MQTT_PORT, help="MQTT broker port")
     ap.add_argument("--mqtt-client-id", default=DEFAULT_CLIENT_ID,
                     help="stable client ID for the embedded persistent MQTT session")
     ap.add_argument("--http-log", action="store_true",
                     help="show Werkzeug access logs for every dashboard polling request")
     args = ap.parse_args()
-    if not 1 <= args.mqtt_port <= 65535:
-        ap.error("--mqtt-port must be between 1 and 65535")
-
     # Dash polls every 2.5 seconds. Suppress one access-log line per callback by
     # default while preserving warnings/errors; --http-log restores full output.
     if not args.http_log:
@@ -353,8 +357,8 @@ def main():
     try:
         if not args.no_ingest:
             subscriber = Subscriber(
-                host=args.mqtt_host,
-                port=args.mqtt_port,
+                host=config.MQTT_HOST,
+                port=config.MQTT_PORT,
                 client_id=args.mqtt_client_id,
                 db_path=args.db,
             )

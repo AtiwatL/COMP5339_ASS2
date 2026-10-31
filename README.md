@@ -4,6 +4,8 @@ COMP5339 Assignment 2 - **TUT19_G07**.
 
 This project converts all 1,926 chargers from the Assignment 1 DuckDB database into a one-day synthetic EV charging stream. JSON events are published through MQTT, validated and stored in DuckDB, then displayed on a live Dash dashboard.
 
+MQTT always uses the local Mosquitto broker at `localhost:1883`; the run commands do not accept broker-address overrides.
+
 ```text
 A1 DuckDB -> station preparation -> data generation -> stream preparation
                                                            |
@@ -123,6 +125,8 @@ This applies the schema without deleting stored events. To discard all A2 events
 python -m evstream.db --reset
 ```
 
+**Expected output after database initialisation:** `data/db/ev_chargers.duckdb` contains a working copy of the Assignment 1 charger tables plus the Assignment 2 event tables and views listed below. A fresh database has no received events yet; `python -m evstream.db` preserves any events already stored, while `--reset` starts with empty A2 event history.
+
 ### 2. Install and start Mosquitto
 
 Install the local MQTT broker if it is not already available:
@@ -148,7 +152,7 @@ mosquitto -c .\mosquitto\mosquitto.conf
 Open a second terminal in the repository directory. Activate whichever Python environment you created, then run:
 
 ```powershell
-python -m evstream.dashboard.app --mqtt-host localhost --mqtt-port 1883
+python -m evstream.dashboard.app
 ```
 
 Open <http://127.0.0.1:8050>. The dashboard process starts a background MQTT subscriber and writes received events to DuckDB.
@@ -159,7 +163,6 @@ Open a third terminal in the repository directory. Activate the same environment
 
 ```powershell
 python -m evstream.publisher `
-    --host localhost `
     --from "2026-10-01 09:00" `
     --until "2026-10-01 13:00"
 ```
@@ -228,6 +231,27 @@ python -m evstream.generation
 
 The first command writes the AC/DC station inputs. The second command passes those files to the supplied generator and merges its station, hourly-price, session and metering outputs into `data/generated`.
 
+### How generation works
+
+```text
+A1 DuckDB charger/site/operator/rating/region tables
+                 |
+                 v
+evstream.stations -> stations_input_ac.csv + stations_input_dc.csv
+                 |
+                 v
+evstream.generation -> supplied generator (AC and DC runs)
+                 |
+                 v
+stations.csv + prices_hourly.csv + sessions.csv + session_metering.csv
+```
+
+`stations.py` exports the generator's required `station_id`, name, coordinates, site type, connector count and maximum power from the A1 tables. It keeps `station_id = charger_id`, which lets every later event join directly to the original charger. Greater Sydney, Newcastle and Lake Macquarie, and Illawarra are classified as urban; other SA4 regions are regional. Chargers without a recorded AC rating use the observed AC median of 22 kW for simulation. These preparation rules affect generator input; they do not alter the A1 database.
+
+`generation.py` runs the supplied generator twice: once for DC chargers and once for AC chargers. The groups use different session rates and meter intervals (shown below), but share the same 1 October 2026 simulation date and AEMO NSW1 wholesale-price series. It merges the four generated CSV types, adds a `sim_group` column, and checks whether the AEMO data covers every simulated hour. `stations.csv` contains station details; `prices_hourly.csv` contains hourly tariffs; `sessions.csv` contains session starts, ends and final totals; and `session_metering.csv` contains readings during sessions. Some sessions finish after midnight on 2 October.
+
+**Expected output after generation:** `stations.py` prints the number of exported chargers, the AC/DC and urban/regional breakdown, and power-source counts. `generation.py` prints row counts for each merged CSV and AEMO hourly coverage. The current files in `data/generated/` contain 1,926 stations, 46,224 hourly price rows, 9,576 sessions and 120,093 meter readings. The two `stations_input_*.csv` files are the generator inputs; the four merged CSVs are the inputs for stream preparation. No MQTT messages or A2 database events are created at this stage.
+
 ## Rebuild generated data
 
 The generated outputs are already included. To reproduce them:
@@ -255,23 +279,54 @@ Generation parameters are:
 
 Both groups use the same day and AEMO NSW1 wholesale-price series. Their outputs are merged into `data/generated`.
 
+### How the event stream is prepared
+
+```text
+Four merged generated CSVs
+          |
+          v
+evstream.stream -> event creation -> price-change filtering -> time ordering
+          |
+          +--> data/stream/events.parquet (publisher input)
+          `--> data/stream/events.jsonl (readable message copy)
+```
+
+Run `python -m evstream.stream` after generation. It reads the merged price, session and metering CSVs and creates `price_update`, `session_start`, `meter` and `session_end` events. The first hourly price for each charger is published; later hourly rows become events only when that charger's customer price changes. A start event contains the connector, vehicle and price known at connection time. Meter events contain electrical readings, cumulative energy and state of charge. End events contain final duration, energy and cost.
+
+Events are ordered by simulated time, then by event type (`price_update`, `session_start`, `meter`, `session_end`) and stable identifiers. A global `seq` records that order; a stable `event_id` supports duplicate detection. The script verifies unique event IDs and checks that no meter or end event precedes its session start. It writes an ordered Parquet file for the publisher and a JSONL copy of the same messages for inspection and submission. The current stream has 171,987 events, from 1 October 00:00:00 to 2 October 03:56:41 AEST.
+
+**Expected output after stream preparation:** The command prints the total event and charger counts, the first and last event times, a count by event type, and how many unchanged hourly prices were removed. `data/stream/events.parquet` and `data/stream/events.jsonl` should each represent the same 171,987 ordered messages. The current breakdown is 32,742 `price_update`, 9,576 `session_start`, 120,093 `meter` and 9,576 `session_end` events. These are prepared files; they have not yet been sent to Mosquitto.
+
 ## Publishing options
+
+```text
+events.parquet JSON messages -> evstream.publisher -> local Mosquitto
+                               |                       |
+                               v                       v
+                    checkpoint + run log      charger/event MQTT topics
+```
+
+Start the local Mosquitto broker and the dashboard/subscriber before publishing. The publisher reads the JSON `message` field from `events.parquet` in sequence order and sends one message per event to `COMP5339/TUT19_G07/ev/<charger_id>/<event_type>`. It uses MQTT QoS 1, waits for publish acknowledgements, and saves the highest safely acknowledged sequence in `publisher_checkpoint.json`. Normal publishing spaces messages by at least 0.1 seconds; publishing the full stream therefore takes about 4 hours 47 minutes before other overhead. Use a time window for a short live demonstration.
 
 ```powershell
 # Complete stream
-python -m evstream.publisher --host localhost
+python -m evstream.publisher
 
 # First 100 messages
-python -m evstream.publisher --host localhost --limit 100
+python -m evstream.publisher --limit 100
 
 # Continue after the saved acknowledged sequence
-python -m evstream.publisher --host localhost --resume
+python -m evstream.publisher --resume
 
 # Send all events through the local broker without the artificial delay
-python -m evstream.publisher --host localhost --backfill
+python -m evstream.publisher --backfill
 ```
 
 Backfill still sends JSON through Mosquitto and the subscriber still validates and stores every message. It only removes the 0.1-second demonstration delay. It is restricted to a local broker and recorded in `data/stream/publish_runs.jsonl`.
+
+`--limit` stops after a chosen number of messages, while `--resume` continues after the saved acknowledged sequence. `--from` and `--until` select a simulated-time window. The publisher records each run's mode, delay and sequence range in `publish_runs.jsonl`. Backfill is intended to load history through the same MQTT ingestion path before a normal-speed demonstration.
+
+**Expected output after publishing:** The terminal reports the local broker connection, publish progress and the final number of messages sent. Mosquitto receives JSON messages on the charger/event topics; the subscriber can then ingest them. `data/stream/publisher_checkpoint.json` records the latest safely acknowledged sequence, and `data/stream/publish_runs.jsonl` gains one audit record for the run. A window or `--limit` run sends only its selected events (plus any bootstrap events for `--from`), so its count can be smaller than 171,987. These files record publishing progress; the subscriber controls what has been committed to DuckDB.
 
 ### Window bootstrap
 
@@ -330,6 +385,20 @@ price_update -> session_start -> meter -> session_end
 
 ## Subscription and ingestion
 
+```text
+Local Mosquitto -> MQTT topic/payload check -> event validation
+                                              |
+                                              v
+                          one DuckDB transaction per new event
+                         /             |                 \
+                    event_log      typed event table    charger_live_state
+                         \             |                 /
+                          `------------+----------------'
+                                       |
+                                       v
+                           MQTT acknowledgement
+```
+
 Normal live mode runs the subscriber and dashboard together:
 
 ```text
@@ -343,11 +412,13 @@ one dashboard process
 `-- one DuckDB database file
 ```
 
+The Paho client subscribes to every charger and event type using the `+/+` wildcard. It checks that the MQTT topic agrees with the payload's charger ID and event type. `EventIngestor` then validates the JSON envelope and event-specific fields. Database-dependent checks and writes happen inside one transaction for each message: an immutable `event_log` row, the matching typed event row, and any change to `charger_live_state` commit together. The subscriber manually acknowledges a QoS 1 message only after it is committed or confirmed as an identical duplicate. Invalid messages are logged and acknowledged; unexpected database errors leave the message unacknowledged for retry.
+
 Each new message is processed atomically:
 
 ```text
 BEGIN
-  validate envelope and event-specific fields
+  check database-dependent event consistency
   insert immutable event_log row
   insert typed event row
   update charger_live_state
@@ -355,21 +426,36 @@ COMMIT
 acknowledge the QoS 1 MQTT message
 ```
 
-An identical redelivery is returned as a duplicate and not inserted again. A conflicting message that reuses an existing `event_id` is rejected.
+The JSON envelope and event-specific fields are validated before `BEGIN`. A repeated `event_id` with identical content is a harmless redelivery; the ingestor does not insert it again. Reusing an `event_id` with different content is rejected. This yields one stored copy per event ID despite MQTT's at-least-once delivery.
 
-For headless ingestion without the dashboard:
+### Standalone subscriber: ingest only
+
+After starting Mosquitto and initialising the A2 database, run this command in its own terminal to receive and store events without opening a web dashboard:
 
 ```powershell
-python -m evstream.subscriber --host localhost --port 1883
+python -m evstream.subscriber
 ```
 
-Do not run the standalone subscriber and embedded dashboard subscriber together. To view an existing database without subscribing:
+This process only subscribes to MQTT, validates messages and writes them to DuckDB. It does not start Dash, serve a page at port 8050, draw a map or calculate dashboard figures. Start the publisher in another terminal to send events to it. Stop the subscriber with Ctrl+C when ingestion is complete.
+
+The normal dashboard command below starts its own embedded subscriber, so do not run both subscriber modes at once. To view an already populated database without subscribing to MQTT, use:
 
 ```powershell
 python -m evstream.dashboard.app --no-ingest
 ```
 
+**Expected output after subscription and ingestion:** The standalone subscriber prints its connection and topic subscription, then reports received, stored, duplicate and rejected counts when it stops. It produces no dashboard or HTTP address. Each accepted new message adds one `event_log` row and one corresponding typed event row in `data/db/ev_chargers.duckdb`; price and session events also update the appropriate current state. Replayed identical messages increase the duplicate count without adding new rows. Counts in DuckDB reflect messages actually received, so a short demonstration window will not populate the entire generated history.
+
 ## Database design
+
+```text
+A1 DuckDB copy + A2 schema -> data/db/ev_chargers.duckdb
+                                    |
+                  received events -> event tables + live-state table
+                                    |
+                                    v
+                         dashboard views and queries
+```
 
 The original `data/a1/ev_chargers_a1.duckdb` is not modified. `evstream.db` copies it to `data/db/ev_chargers.duckdb` and adds only the A2 event tables and views. 
 
@@ -393,7 +479,48 @@ Historical event tables are append-only. Only `charger_live_state` is updated, a
 
 ## Dashboard information
 
+```text
+Local Mosquitto -> embedded Subscriber -> DuckDB committed state
+                                               |
+                                               v
+                                      dashboard/queries.py
+                                               |
+                               +---------------+----------------+
+                               |                                |
+                         dashboard/app.py                dashboard/figures.py
+                               |                                |
+                               +--------------+-----------------+
+                                              |
+                                 Dash page + Leaflet map
+                                              |
+                           assets/map.js + assets/style.css
+```
+
 The dashboard includes a charger map, live network metrics, stored historical metrics, charging curves, price history, hourly network activity, top chargers and a recent-event feed.
+
+For the live dashboard with subscription and ingestion, start Mosquitto first, then run:
+
+```powershell
+python -m evstream.dashboard.app
+```
+
+Open `http://127.0.0.1:8050` and start the publisher in a separate terminal. This one dashboard process starts an embedded MQTT subscriber in a background thread; there is no need to run `python -m evstream.subscriber` as well. It receives, validates and stores events while Dash polls committed DuckDB state every 2.5 seconds. The map joins A1 locations and charger attributes with `charger_live_state`; markers show whether a charger has reported and its occupancy, and clicking one opens details. Operator, charger-type and idle-charger controls narrow the displayed markers. The map refreshes its features when the data or filters change, while an open charger panel continues to refresh.
+
+### Dashboard folder: files and execution
+
+Run the package entry point from the repository root, not by opening an individual file in `evstream/dashboard/`. `python -m evstream.dashboard.app` imports `queries.py` and `figures.py`, creates the Dash layout and callbacks, starts the embedded subscriber, and serves the page. Dash loads files in the `assets/` folder automatically when the page opens.
+
+| File | Purpose |
+|---|---|
+| `dashboard/app.py` | Starts the server and embedded subscriber; defines the page layout, map features, filters, popup, metrics and refresh callbacks. |
+| `dashboard/queries.py` | Reads committed DuckDB data for map markers, current state, charger history, charging curves, price history, network metrics and event feed. It does not ingest MQTT messages. |
+| `dashboard/figures.py` | Converts query results into Plotly charging, price-history, hourly-activity and top-charger charts, including empty-state figures. |
+| `dashboard/assets/map.js` | Supplies Leaflet marker and cluster rendering for the GeoJSON map, including price and occupancy labels. |
+| `dashboard/assets/style.css` | Styles the page layout, markers, popup, metric cards, filters and responsive display. |
+
+On each refresh, `app.py` asks `queries.py` for the latest stored state and passes chart data to `figures.py`. The browser uses `map.js` and `style.css` to render that state. Only the embedded `Subscriber` and `EventIngestor` write events; dashboard queries read committed rows.
+
+The top metrics separate current state (active sessions, chargers in use, current power and average live price) from stored history (completed sessions, delivered energy and revenue). A selected charger's panel shows its latest price and update time, active connector count, current charging power, completed-session statistics, a meter-based charging curve and price history. If no session is active, the curve shows the latest completed session. The side panel shows hourly network activity, top chargers by delivered energy and a recent-event feed. The dashboard's simulated clock follows the latest stored event timestamp; it is not the computer's wall clock.
 
 Each charger panel explicitly displays:
 
@@ -405,6 +532,8 @@ Each charger panel explicitly displays:
 - charger ID, type, maximum power, connector count, area and status.
 
 Historical labels refer to **stored streamed history**, not a fixed seven-day dataset. With the current one-day simulation, charts show only events actually received for that day and any late session completions. No unavailable days are fabricated.
+
+**Expected output after starting the dashboard:** The app is available at `http://127.0.0.1:8050`. Before any events are received, it shows charger locations and a waiting-for-events state. While the publisher runs, the simulated timestamp, marker state, current metrics, selected charger details, charging curve and event feed update from committed DuckDB data. Historical charts and totals grow as session events arrive. The dashboard itself creates no new synthetic events; its displayed history is limited to what the subscriber has stored.
 
 ## Project structure
 
@@ -420,11 +549,11 @@ COMP5339_ASS2/
 |   |-- config.py
 |   |-- stations.py
 |   |-- generation.py
+|   |-- db.py
 |   |-- stream.py
 |   |-- publisher.py
 |   |-- subscriber.py
 |   |-- ingest.py
-|   |-- db.py
 |   `-- dashboard/
 `-- data/
     |-- a1/ev_chargers_a1.duckdb
